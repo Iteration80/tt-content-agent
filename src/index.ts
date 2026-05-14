@@ -61,6 +61,25 @@ interface GeneratedPayload {
   processedPhotos: RawPhotos;
   agentOutput: AgentOutput;
   agentFlags: string[];
+  photoAnalysis: PhotoAnalysis;
+}
+
+interface PhotoAnalysis {
+  presentSlots: string[];
+  missingRecommendedSlots: string[];
+  legacySlots: string[];
+  generatedOutputSlots: string[];
+  photoCount: number;
+  primarySlot: string | null;
+  qaConfidence: number;
+  flags: string[];
+  reviewLabel: "photo-qa-pass" | "photo-qa-review";
+  internalSummary: string;
+}
+
+interface PrimaryImageSelection {
+  url: string;
+  slot: string | null;
 }
 
 interface AgentOutput {
@@ -170,8 +189,35 @@ type Color =
   | "Multicolor";
 
 const IMAGE_PREFIX = "https://images.threadandtime.com/";
-const AGENT_VERSION = "worker-pass-through-v1";
-const MODEL = "deterministic-worker-stub";
+const AGENT_VERSION = "worker-photo-qa-v1";
+const MODEL = "deterministic-photo-qa";
+
+const RECOMMENDED_PHOTO_SLOTS = [
+  "detail",
+  "flat_lay",
+  "hanger",
+  "on_model_back",
+  "on_model_front",
+  "on_model_hero",
+  "tag_label",
+];
+
+const LEGACY_SLOT_ALIASES: Record<string, string> = {
+  hero_on_model: "on_model_hero",
+};
+
+const GENERATED_OUTPUT_RAW_SLOTS = new Set(["ghost_mannequin", "hero_clean_bg", "hero_brand_bg", "lifestyle"]);
+
+const PHOTO_SLOT_LABELS: Record<string, string> = {
+  damage: "Damage",
+  detail: "Detail",
+  flat_lay: "Flat Lay",
+  hanger: "Hanger",
+  on_model_back: "On-Model Back",
+  on_model_front: "On-Model Front",
+  on_model_hero: "On-Model Hero",
+  tag_label: "Tag-Label",
+};
 
 const CATEGORY_CONFIG: Record<Category, CategoryConfig> = {
   ACCESSORIES: {
@@ -445,11 +491,12 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
     .slice(0, 20);
   const processedPhotos = copyRawPhotos(rawPhotos);
   const imageUrls = flattenPhotoUrls(processedPhotos);
-  const primaryImageUrl = pickPrimaryImage(processedPhotos, config.hero, imageUrls);
+  const primaryImage = pickPrimaryImage(processedPhotos, config.hero, imageUrls);
 
-  if (!primaryImageUrl) throw new Error("processed_photos produced no media URLs");
+  if (!primaryImage) throw new Error("processed_photos produced no media URLs");
 
-  const agentFlags = buildAgentFlags(intake, item.imageFlags);
+  const photoAnalysis = analyzePhotoSet(rawPhotos, primaryImage.slot, intake);
+  const agentFlags = buildAgentFlags(intake, item.imageFlags, photoAnalysis);
   const title =
     typeof intake.manual_title_override === "string" && intake.manual_title_override.trim()
       ? truncate(intake.manual_title_override, 80)
@@ -473,9 +520,9 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
       package_dims_in: config.packageDimsIn,
       listing_price_cents: nonnegativeInt(intake.price_target_cents),
       cost_of_goods_cents: nonnegativeInt(intake.purchase_price_cents),
-      vendoo_labels: ["content-agent-pass-through", "needs-human-qa"],
+      vendoo_labels: ["content-agent-photo-qa", photoAnalysis.reviewLabel, "needs-human-qa"],
       internal_notes:
-        "Pass-through Content Agent output. Real uploaded photos are reused as processed photos; no Nano Banana or AI listing call has run yet.",
+        `Photo QA: ${photoAnalysis.internalSummary} Uploaded photos are reused as processed photos; no Nano Banana or AI listing call has run yet.`,
     },
     platform_specific: {
       depop: {
@@ -494,7 +541,7 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
       },
     },
     media: {
-      primary_image_url: primaryImageUrl,
+      primary_image_url: primaryImage.url,
       image_urls: imageUrls.slice(0, 24),
     },
     agent_metadata: {
@@ -506,7 +553,7 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
         brand: brand === "Unbranded" ? 0.4 : 0.82,
         price: 0.86,
         category_mapping: 0.9,
-        photo_processing: 0.3,
+        photo_processing: photoAnalysis.qaConfidence,
       },
       flags: agentFlags,
       generated_at: now,
@@ -519,6 +566,7 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
     processedPhotos,
     agentOutput,
     agentFlags,
+    photoAnalysis,
   };
 }
 
@@ -529,11 +577,21 @@ async function commitProcessed(
   now: string
 ): Promise<void> {
   const detail: Record<string, JsonValue> = {
-    pass_through_worker: true,
+    photo_qa_worker: true,
     agent_version: AGENT_VERSION,
     model: MODEL,
     processed_photo_slots: Object.keys(generated.processedPhotos),
     flags: generated.agentFlags,
+    photo_qa: toJsonValue({
+      photo_count: generated.photoAnalysis.photoCount,
+      present_slots: generated.photoAnalysis.presentSlots,
+      missing_recommended_slots: generated.photoAnalysis.missingRecommendedSlots,
+      primary_slot: generated.photoAnalysis.primarySlot,
+      legacy_slots: generated.photoAnalysis.legacySlots,
+      generated_output_raw_slots: generated.photoAnalysis.generatedOutputSlots,
+      confidence: generated.photoAnalysis.qaConfidence,
+      review_label: generated.photoAnalysis.reviewLabel,
+    }),
   };
   if (item.imageFlags) detail.reprocess_image_flags = toJsonValue(item.imageFlags);
 
@@ -634,7 +692,11 @@ function flattenPhotoUrls(photos: RawPhotos): string[] {
     .filter((url) => typeof url === "string" && url.startsWith(IMAGE_PREFIX));
 }
 
-function pickPrimaryImage(photos: RawPhotos, heroSlot: string, imageUrls: string[]): string | undefined {
+function pickPrimaryImage(
+  photos: RawPhotos,
+  heroSlot: string,
+  imageUrls: string[]
+): PrimaryImageSelection | undefined {
   const preferredSlots = [
     heroSlot,
     "on_model_hero",
@@ -650,14 +712,156 @@ function pickPrimaryImage(photos: RawPhotos, heroSlot: string, imageUrls: string
   ];
   for (const slot of unique(preferredSlots)) {
     const photo = firstPhoto(photos[slot]);
-    if (photo) return photo;
+    if (photo) return { url: photo, slot };
   }
-  return imageUrls[0];
+  return imageUrls[0] ? { url: imageUrls[0], slot: null } : undefined;
 }
 
 function firstPhoto(value: string | string[] | undefined): string | null {
   if (!value) return null;
   return Array.isArray(value) ? value[0] ?? null : value;
+}
+
+function analyzePhotoSet(rawPhotos: RawPhotos, primarySlot: string | null, intake: IntakeJson): PhotoAnalysis {
+  const presentSlots = photoSlots(rawPhotos);
+  const missingRecommendedSlots = RECOMMENDED_PHOTO_SLOTS.filter((slot) => !presentSlots.includes(slot));
+  const legacySlots = Object.keys(rawPhotos)
+    .filter((slot) => LEGACY_SLOT_ALIASES[slot])
+    .sort();
+  const generatedOutputSlots = Object.keys(rawPhotos)
+    .filter((slot) => GENERATED_OUTPUT_RAW_SLOTS.has(slot))
+    .sort();
+  const photoCount = countPhotoUrls(rawPhotos);
+  const canonicalPrimarySlot = primarySlot ? canonicalSlot(primarySlot) : null;
+  const flags: string[] = [];
+
+  if (missingRecommendedSlots.length === 0) {
+    flags.push("photo_qa_recommended_slots_complete");
+  } else {
+    for (const slot of missingRecommendedSlots) {
+      flags.push(`photo_qa_missing_${slot}`);
+    }
+  }
+
+  if (!hasPhotoSlot(rawPhotos, "on_model_hero") && !hasPhotoSlot(rawPhotos, "on_model_front")) {
+    flags.push("photo_qa_missing_front_view");
+  }
+  if (photoCount < 4) flags.push("photo_qa_thin_photo_set");
+  if (hasText(intake.damage_notes) && !hasPhotoSlot(rawPhotos, "damage")) {
+    flags.push("photo_qa_damage_notes_without_damage_photo");
+  }
+  if (hasPhotoSlot(rawPhotos, "damage") && !hasText(intake.damage_notes)) {
+    flags.push("photo_qa_damage_photo_without_damage_notes");
+  }
+  for (const slot of legacySlots) {
+    flags.push(`photo_qa_legacy_slot_${slot}`);
+  }
+  for (const slot of generatedOutputSlots) {
+    flags.push(`photo_qa_raw_contains_generated_output_${slot}`);
+  }
+  if (canonicalPrimarySlot === "on_model_hero") {
+    flags.push("photo_qa_primary_on_model_hero");
+  } else if (canonicalPrimarySlot) {
+    flags.push(`photo_qa_primary_fallback_${canonicalPrimarySlot}`);
+  } else {
+    flags.push("photo_qa_primary_fallback_first_upload");
+  }
+
+  const reviewLabel = flags.some((flag) => {
+    return (
+      flag.startsWith("photo_qa_missing_") ||
+      flag.includes("_without_") ||
+      flag.includes("raw_contains_generated_output") ||
+      flag === "photo_qa_thin_photo_set"
+    );
+  })
+    ? "photo-qa-review"
+    : "photo-qa-pass";
+  const qaConfidence = photoQaConfidence({
+    presentSlots,
+    missingRecommendedSlots,
+    generatedOutputSlots,
+    photoCount,
+    rawPhotos,
+    intake,
+  });
+
+  const internalSummary = [
+    `${photoCount} uploaded photo${photoCount === 1 ? "" : "s"} across ${formatSlotList(presentSlots)}.`,
+    `Missing recommended slots: ${formatSlotList(missingRecommendedSlots)}.`,
+    `Primary slot: ${canonicalPrimarySlot ? humanSlot(canonicalPrimarySlot) : "first uploaded image"}.`,
+  ].join(" ");
+
+  return {
+    presentSlots,
+    missingRecommendedSlots,
+    legacySlots,
+    generatedOutputSlots,
+    photoCount,
+    primarySlot: canonicalPrimarySlot,
+    qaConfidence,
+    flags: unique(flags),
+    reviewLabel,
+    internalSummary,
+  };
+}
+
+function canonicalSlot(slot: string): string {
+  return LEGACY_SLOT_ALIASES[slot] ?? slot;
+}
+
+function photoSlots(rawPhotos: RawPhotos): string[] {
+  return unique(Object.keys(rawPhotos).map((slot) => canonicalSlot(slot))).sort();
+}
+
+function countPhotoUrls(photos: RawPhotos): number {
+  return Object.values(photos).reduce((count, value) => {
+    return count + (Array.isArray(value) ? value.length : 1);
+  }, 0);
+}
+
+function hasPhotoSlot(rawPhotos: RawPhotos, slot: string): boolean {
+  return Object.keys(rawPhotos).some((rawSlot) => canonicalSlot(rawSlot) === slot);
+}
+
+function hasText(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function photoQaConfidence({
+  presentSlots,
+  missingRecommendedSlots,
+  generatedOutputSlots,
+  photoCount,
+  rawPhotos,
+  intake,
+}: {
+  presentSlots: string[];
+  missingRecommendedSlots: string[];
+  generatedOutputSlots: string[];
+  photoCount: number;
+  rawPhotos: RawPhotos;
+  intake: IntakeJson;
+}): number {
+  const presentRecommendedCount = RECOMMENDED_PHOTO_SLOTS.length - missingRecommendedSlots.length;
+  let score = 0.35 + (presentRecommendedCount / RECOMMENDED_PHOTO_SLOTS.length) * 0.45;
+
+  if (presentSlots.includes("on_model_hero")) score += 0.08;
+  else if (presentSlots.includes("on_model_front")) score += 0.04;
+  if (presentSlots.includes("tag_label")) score += 0.04;
+  if (hasText(intake.damage_notes) === hasPhotoSlot(rawPhotos, "damage")) score += 0.03;
+  if (photoCount < 4) score -= 0.08;
+  score -= generatedOutputSlots.length * 0.05;
+
+  return Number(Math.min(0.95, Math.max(0.2, score)).toFixed(2));
+}
+
+function formatSlotList(slots: string[]): string {
+  return slots.length ? slots.map(humanSlot).join(", ") : "none";
+}
+
+function humanSlot(slot: string): string {
+  return PHOTO_SLOT_LABELS[slot] ?? titleCase(slot.replace(/_/g, " "));
 }
 
 function buildTitle({
@@ -753,8 +957,8 @@ function buildDepopHashtags({
   return hashtags.map((tag) => tag.slice(0, 30));
 }
 
-function buildAgentFlags(intake: IntakeJson, imageFlags: unknown): string[] {
-  const flags = ["worker_stub_no_ai", "processed_photos_reuse_raw_uploads"];
+function buildAgentFlags(intake: IntakeJson, imageFlags: unknown, photoAnalysis: PhotoAnalysis): string[] {
+  const flags = ["worker_photo_qa_v1", "processed_photos_reuse_raw_uploads", ...photoAnalysis.flags];
   if (!intake.era_guess || intake.era_guess === "unknown") flags.push("era_defaulted_to_2000s");
   if (!Array.isArray(intake.style_tags) || intake.style_tags.length === 0) flags.push("style_tags_defaulted");
   if (!intake.source_tag) flags.push("source_tag_defaulted");

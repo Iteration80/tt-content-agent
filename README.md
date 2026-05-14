@@ -2,7 +2,7 @@
 
 Cloudflare Worker that claims submitted intake rows and moves them to review.
 
-This first deployable version is a pass-through processor: it reuses the real uploaded R2 photo URLs as `processed_photos`, generates schema-valid preliminary listing JSON deterministically, and sets `status='needs_approval'`. It is deliberately shaped so Nano Banana image processing and the Sonnet listing pass can replace the deterministic generator without changing the intake/review D1 contract.
+This deployable version is a deterministic photo-QA processor: it reuses the real uploaded R2 photo URLs as `processed_photos`, checks the uploaded photo slot coverage, flags missing/review-worthy photo issues, generates schema-valid preliminary listing JSON, and sets `status='needs_approval'`. It is deliberately shaped so Nano Banana image processing and the Sonnet listing pass can replace the deterministic generator without changing the intake/review D1 contract.
 
 ## Commands
 
