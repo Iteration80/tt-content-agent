@@ -1,0 +1,28 @@
+{
+  "$schema": "../tt-intake/node_modules/wrangler/config-schema.json",
+  "name": "tt-content-agent",
+  "main": "src/index.ts",
+  "workers_dev": false,
+  "preview_urls": false,
+  "compatibility_date": "2026-05-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tt-intake-db",
+      "database_id": "1b532275-c626-4aec-9477-d250012af3bd"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PHOTOS",
+      "bucket_name": "threadandtime-images"
+    }
+  ]
+}
