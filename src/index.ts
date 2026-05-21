@@ -861,29 +861,20 @@ async function generateListingAi(env: Env, context: ListingContext): Promise<Lis
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(ANTHROPIC_MESSAGES_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "x-api-key": apiKey,
-        "anthropic-version": ANTHROPIC_VERSION,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(buildListingAiRequest(model, context)),
-    });
-    const text = await res.text();
+    const firstAttempt = await callAnthropicListing(apiKey, model, context, controller, true);
+    if (firstAttempt.ok) return firstAttempt;
 
-    if (!res.ok) {
-      return {
-        ok: false,
-        flag: "listing_ai_failed",
-        detail: `Anthropic Messages API returned ${res.status}: ${truncate(text, 220)}`,
-      };
+    if (!firstAttempt.imageProcessingFailed) {
+      return firstAttempt;
     }
 
-    const parsed = parseJson<Record<string, unknown>>(text, "Anthropic listing response");
-    const draft = parseListingAiDraft(extractListingToolInput(parsed));
-    return { ok: true, draft, model };
+    const retry = await callAnthropicListing(apiKey, model, context, controller, false);
+    if (retry.ok) {
+      retry.draft.flags = unique([...retry.draft.flags, "image_inputs_skipped"]);
+      return retry;
+    }
+
+    return retry;
   } catch (error) {
     return {
       ok: false,
@@ -895,7 +886,40 @@ async function generateListingAi(env: Env, context: ListingContext): Promise<Lis
   }
 }
 
-function buildListingAiRequest(model: string, context: ListingContext): Record<string, unknown> {
+async function callAnthropicListing(
+  apiKey: string,
+  model: string,
+  context: ListingContext,
+  controller: AbortController,
+  includeImages: boolean
+): Promise<ListingAiResult & { imageProcessingFailed?: boolean }> {
+  const res = await fetch(ANTHROPIC_MESSAGES_URL, {
+    method: "POST",
+    signal: controller.signal,
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": ANTHROPIC_VERSION,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(buildListingAiRequest(model, context, includeImages)),
+  });
+  const text = await res.text();
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      flag: "listing_ai_failed",
+      detail: `Anthropic Messages API returned ${res.status}: ${truncate(text, 220)}`,
+      imageProcessingFailed: res.status === 400 && text.includes("Could not process image"),
+    };
+  }
+
+  const parsed = parseJson<Record<string, unknown>>(text, "Anthropic listing response");
+  const draft = parseListingAiDraft(extractListingToolInput(parsed));
+  return { ok: true, draft, model };
+}
+
+function buildListingAiRequest(model: string, context: ListingContext, includeImages: boolean): Record<string, unknown> {
   const content: Record<string, unknown>[] = [
     {
       type: "text",
@@ -903,14 +927,16 @@ function buildListingAiRequest(model: string, context: ListingContext): Record<s
     },
   ];
 
-  for (const url of representativeImageUrls(context)) {
-    content.push({
-      type: "image",
-      source: {
-        type: "url",
-        url,
-      },
-    });
+  if (includeImages) {
+    for (const url of representativeImageUrls(context)) {
+      content.push({
+        type: "image",
+        source: {
+          type: "url",
+          url,
+        },
+      });
+    }
   }
 
   return {
