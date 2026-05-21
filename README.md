@@ -26,10 +26,10 @@ npx wrangler secret put TT_CONTENT_AGENT_TRIGGER_TOKEN
 npx wrangler pages secret put TT_CONTENT_AGENT_TRIGGER_TOKEN --project-name tt-intake --env preview
 ```
 
-Set `OPENAI_API_KEY` to enable the AI listing pass. `TT_LISTING_AI_MODEL` is optional and defaults to `gpt-5.4-mini`; `TT_LISTING_AI_TIMEOUT_MS` is optional and defaults to `20000`.
+Set `ANTHROPIC_API_KEY` to enable the AI listing pass. `TT_LISTING_AI_MODEL` is optional and defaults to `claude-sonnet-4-20250514`; `TT_LISTING_AI_TIMEOUT_MS` is optional and defaults to `20000`.
 
 ```bash
-npx wrangler secret put OPENAI_API_KEY
+npx wrangler secret put ANTHROPIC_API_KEY
 npx wrangler secret put TT_LISTING_AI_MODEL
 ```
 

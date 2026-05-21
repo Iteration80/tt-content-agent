@@ -6,7 +6,7 @@ interface Env {
   DB: D1Database;
   PHOTOS: R2Bucket;
   TT_CONTENT_AGENT_TRIGGER_TOKEN?: string;
-  OPENAI_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string;
   TT_LISTING_AI_MODEL?: string;
   TT_LISTING_AI_TIMEOUT_MS?: string;
 }
@@ -247,10 +247,12 @@ type Color =
 const IMAGE_PREFIX = "https://images.threadandtime.com/";
 const AGENT_VERSION = "worker-listing-ai-v1";
 const FALLBACK_MODEL = "deterministic-listing-fallback";
-const DEFAULT_LISTING_AI_MODEL = "gpt-5.4-mini";
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const DEFAULT_LISTING_AI_MODEL = "claude-sonnet-4-20250514";
+const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION = "2023-06-01";
 const LISTING_AI_PROMPT_VERSION = "listing-ai-prompt-v1";
 const DEFAULT_LISTING_AI_TIMEOUT_MS = 20_000;
+const LISTING_AI_TOOL_NAME = "emit_listing_draft";
 
 const RECOMMENDED_PHOTO_SLOTS = [
   "detail",
@@ -844,12 +846,12 @@ function firstPhoto(value: string | string[] | undefined): string | null {
 }
 
 async function generateListingAi(env: Env, context: ListingContext): Promise<ListingAiResult> {
-  const apiKey = env.OPENAI_API_KEY;
+  const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return {
       ok: false,
       flag: "listing_ai_not_configured",
-      detail: "OPENAI_API_KEY is not configured; deterministic fallback used",
+      detail: "ANTHROPIC_API_KEY is not configured; deterministic fallback used",
     };
   }
 
@@ -859,11 +861,12 @@ async function generateListingAi(env: Env, context: ListingContext): Promise<Lis
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(OPENAI_RESPONSES_URL, {
+    const res = await fetch(ANTHROPIC_MESSAGES_URL, {
       method: "POST",
       signal: controller.signal,
       headers: {
-        authorization: `Bearer ${apiKey}`,
+        "x-api-key": apiKey,
+        "anthropic-version": ANTHROPIC_VERSION,
         "content-type": "application/json",
       },
       body: JSON.stringify(buildListingAiRequest(model, context)),
@@ -874,13 +877,12 @@ async function generateListingAi(env: Env, context: ListingContext): Promise<Lis
       return {
         ok: false,
         flag: "listing_ai_failed",
-        detail: `OpenAI Responses API returned ${res.status}: ${truncate(text, 220)}`,
+        detail: `Anthropic Messages API returned ${res.status}: ${truncate(text, 220)}`,
       };
     }
 
-    const parsed = parseJson<Record<string, unknown>>(text, "OpenAI listing response");
-    const outputText = extractResponseText(parsed);
-    const draft = parseListingAiDraft(outputText);
+    const parsed = parseJson<Record<string, unknown>>(text, "Anthropic listing response");
+    const draft = parseListingAiDraft(extractListingToolInput(parsed));
     return { ok: true, draft, model };
   } catch (error) {
     return {
@@ -896,38 +898,41 @@ async function generateListingAi(env: Env, context: ListingContext): Promise<Lis
 function buildListingAiRequest(model: string, context: ListingContext): Record<string, unknown> {
   const content: Record<string, unknown>[] = [
     {
-      type: "input_text",
+      type: "text",
       text: buildListingAiPrompt(context),
     },
   ];
 
   for (const url of representativeImageUrls(context)) {
-    content.push({ type: "input_image", image_url: url, detail: "low" });
+    content.push({
+      type: "image",
+      source: {
+        type: "url",
+        url,
+      },
+    });
   }
 
   return {
     model,
-    store: false,
-    input: [
-      {
-        role: "system",
-        content:
-          "You write concise, accurate resale listing drafts for Thread + Time, a curated vintage, thrift, and resale shop. Return only JSON matching the provided schema. Do not invent fabric content, flaws, brand, measurements, or era. If a detail is uncertain, keep the wording conservative and add a flag.",
-      },
+    max_tokens: 1400,
+    system:
+      "You write concise, accurate resale listing drafts for Thread + Time, a curated vintage, thrift, and resale shop. Use the required tool to return the listing draft. Do not invent fabric content, flaws, brand, measurements, or era. If a detail is uncertain, keep the wording conservative and add a flag.",
+    messages: [
       {
         role: "user",
         content,
       },
     ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: "thread_time_listing_ai",
-        strict: true,
-        schema: LISTING_AI_RESPONSE_SCHEMA,
+    tools: [
+      {
+        name: LISTING_AI_TOOL_NAME,
+        description:
+          "Return one conservative Thread + Time listing draft that matches the existing review schema.",
+        input_schema: LISTING_AI_RESPONSE_SCHEMA,
       },
-    },
-    max_output_tokens: 1400,
+    ],
+    tool_choice: { type: "tool", name: LISTING_AI_TOOL_NAME },
   };
 }
 
@@ -1125,24 +1130,20 @@ function representativeImageUrls(context: ListingContext): string[] {
   return unique([context.primaryImageUrl, ...urls, ...context.imageUrls]).slice(0, 5);
 }
 
-function extractResponseText(response: Record<string, unknown>): string {
-  if (typeof response.output_text === "string") return response.output_text;
-
-  const output = Array.isArray(response.output) ? response.output : [];
-  for (const item of output) {
-    if (!isPlainObject(item)) continue;
-    const content = Array.isArray(item.content) ? item.content : [];
-    for (const block of content) {
-      if (!isPlainObject(block)) continue;
-      if (typeof block.text === "string") return block.text;
+function extractListingToolInput(response: Record<string, unknown>): unknown {
+  const content = Array.isArray(response.content) ? response.content : [];
+  for (const block of content) {
+    if (!isPlainObject(block)) continue;
+    if (block.type === "tool_use" && block.name === LISTING_AI_TOOL_NAME) {
+      return block.input;
     }
   }
 
-  throw new Error("OpenAI response did not include output text");
+  throw new Error("Anthropic response did not include listing tool input");
 }
 
-function parseListingAiDraft(text: string): ListingAiDraft {
-  const draft = parseJson<ListingAiDraft>(text, "listing AI JSON");
+function parseListingAiDraft(input: unknown): ListingAiDraft {
+  const draft = input as ListingAiDraft;
   if (!isPlainObject(draft)) throw new Error("listing AI output must be an object");
   assert(typeof draft.title === "string" && draft.title.trim().length > 0, "listing AI title missing");
   assert(typeof draft.description === "string" && draft.description.trim().length > 0, "listing AI description missing");
