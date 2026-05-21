@@ -2,7 +2,7 @@
 
 Cloudflare Worker that claims submitted intake rows and moves them to review.
 
-This deployable version is a deterministic photo-QA processor: it reuses the real uploaded R2 photo URLs as `processed_photos`, checks the uploaded photo slot coverage, flags missing/review-worthy photo issues, generates schema-valid preliminary listing JSON, and sets `status='needs_approval'`. It is deliberately shaped so Nano Banana image processing and the Sonnet listing pass can replace the deterministic generator without changing the intake/review D1 contract.
+This deployable version runs deterministic photo QA and, when configured, an AI listing pass. It reuses the real uploaded R2 photo URLs as `processed_photos`, checks uploaded photo slot coverage, asks the listing model for schema-constrained title/description/tag/color suggestions, and sets `status='needs_approval'`. If the AI key is missing or the call fails, it still produces a deterministic fallback listing so the intake/review flow stays usable.
 
 ## Commands
 
@@ -24,6 +24,13 @@ Set `TT_CONTENT_AGENT_TRIGGER_TOKEN` as a Worker secret and as a Pages secret be
 ```bash
 npx wrangler secret put TT_CONTENT_AGENT_TRIGGER_TOKEN
 npx wrangler pages secret put TT_CONTENT_AGENT_TRIGGER_TOKEN --project-name tt-intake --env preview
+```
+
+Set `OPENAI_API_KEY` to enable the AI listing pass. `TT_LISTING_AI_MODEL` is optional and defaults to `gpt-5.4-mini`; `TT_LISTING_AI_TIMEOUT_MS` is optional and defaults to `20000`.
+
+```bash
+npx wrangler secret put OPENAI_API_KEY
+npx wrangler secret put TT_LISTING_AI_MODEL
 ```
 
 The Pages app should include this service binding in `wrangler.jsonc`:

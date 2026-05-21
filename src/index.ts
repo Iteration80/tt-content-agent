@@ -6,6 +6,9 @@ interface Env {
   DB: D1Database;
   PHOTOS: R2Bucket;
   TT_CONTENT_AGENT_TRIGGER_TOKEN?: string;
+  OPENAI_API_KEY?: string;
+  TT_LISTING_AI_MODEL?: string;
+  TT_LISTING_AI_TIMEOUT_MS?: string;
 }
 
 interface ExecutionContextLike {
@@ -81,6 +84,59 @@ interface PrimaryImageSelection {
   url: string;
   slot: string | null;
 }
+
+interface ListingContext {
+  sku: string;
+  category: Category;
+  config: CategoryConfig;
+  intake: IntakeJson;
+  brand: string;
+  itemName: string;
+  sizeLabel: string;
+  material: string;
+  condition: Condition;
+  sourceTag: SourceTag;
+  ageTag: Exclude<Era, "unknown">;
+  colors: Color[];
+  styleTags: string[];
+  vendooTags: string[];
+  photoAnalysis: PhotoAnalysis;
+  imageUrls: string[];
+  primaryImageUrl: string;
+  rawPhotos: RawPhotos;
+}
+
+interface ListingAiDraft {
+  title: string;
+  description: string;
+  primary_color: Color;
+  secondary_color: Color | null;
+  tags: string[];
+  style_tags: string[];
+  depop_hashtags: string[];
+  internal_notes: string;
+  confidence: {
+    title: number;
+    description: number;
+    color: number;
+    style_tags: number;
+  };
+  flags: string[];
+}
+
+interface ListingAiSuccess {
+  ok: true;
+  draft: ListingAiDraft;
+  model: string;
+}
+
+interface ListingAiFailure {
+  ok: false;
+  flag: string;
+  detail: string;
+}
+
+type ListingAiResult = ListingAiSuccess | ListingAiFailure;
 
 interface AgentOutput {
   vendoo_form: {
@@ -189,8 +245,12 @@ type Color =
   | "Multicolor";
 
 const IMAGE_PREFIX = "https://images.threadandtime.com/";
-const AGENT_VERSION = "worker-photo-qa-v1";
-const MODEL = "deterministic-photo-qa";
+const AGENT_VERSION = "worker-listing-ai-v1";
+const FALLBACK_MODEL = "deterministic-listing-fallback";
+const DEFAULT_LISTING_AI_MODEL = "gpt-5.4-mini";
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const LISTING_AI_PROMPT_VERSION = "listing-ai-prompt-v1";
+const DEFAULT_LISTING_AI_TIMEOUT_MS = 20_000;
 
 const RECOMMENDED_PHOTO_SLOTS = [
   "detail",
@@ -218,6 +278,27 @@ const PHOTO_SLOT_LABELS: Record<string, string> = {
   on_model_hero: "On-Model Hero",
   tag_label: "Tag-Label",
 };
+
+const COLOR_VALUES: Color[] = [
+  "Black",
+  "White",
+  "Ivory",
+  "Beige",
+  "Brown",
+  "Tan",
+  "Gray",
+  "Silver",
+  "Gold",
+  "Red",
+  "Pink",
+  "Orange",
+  "Yellow",
+  "Green",
+  "Blue",
+  "Navy",
+  "Purple",
+  "Multicolor",
+];
 
 const CATEGORY_CONFIG: Record<Category, CategoryConfig> = {
   ACCESSORIES: {
@@ -406,7 +487,7 @@ async function processOne(env: Env, targetSku?: string): Promise<Record<string, 
 
   try {
     const item = parseItem(row);
-    const generated = buildAgentPayload(item, now);
+    const generated = await buildAgentPayload(env, item, now);
     await commitProcessed(env, item, generated, now);
     return {
       ok: true,
@@ -475,7 +556,7 @@ function parseItem(row: SubmittedRow): ParsedItem {
   };
 }
 
-function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
+async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promise<GeneratedPayload> {
   const { sku, category, config, intake, rawPhotos } = item;
   const brand = cleanText(intake.brand, "Unbranded", 100);
   const itemName = cleanText(intake.item_name, config.noun, 120);
@@ -496,13 +577,34 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
   if (!primaryImage) throw new Error("processed_photos produced no media URLs");
 
   const photoAnalysis = analyzePhotoSet(rawPhotos, primaryImage.slot, intake);
-  const agentFlags = buildAgentFlags(intake, item.imageFlags, photoAnalysis);
+  let agentFlags = buildAgentFlags(intake, item.imageFlags, photoAnalysis);
   const title =
     typeof intake.manual_title_override === "string" && intake.manual_title_override.trim()
       ? truncate(intake.manual_title_override, 80)
       : buildTitle({ brand, ageTag, color: colors[0], material, itemName, sizeLabel });
 
-  const agentOutput: AgentOutput = {
+  const listingContext: ListingContext = {
+    sku,
+    category,
+    config,
+    intake,
+    brand,
+    itemName,
+    sizeLabel,
+    material,
+    condition,
+    sourceTag,
+    ageTag,
+    colors,
+    styleTags,
+    vendooTags,
+    photoAnalysis,
+    imageUrls,
+    primaryImageUrl: primaryImage.url,
+    rawPhotos,
+  };
+
+  let agentOutput: AgentOutput = {
     vendoo_form: {
       title,
       description: buildDescription({ brand, itemName, config, condition, material, sizeLabel, intake }),
@@ -520,9 +622,9 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
       package_dims_in: config.packageDimsIn,
       listing_price_cents: nonnegativeInt(intake.price_target_cents),
       cost_of_goods_cents: nonnegativeInt(intake.purchase_price_cents),
-      vendoo_labels: ["content-agent-photo-qa", photoAnalysis.reviewLabel, "needs-human-qa"],
+      vendoo_labels: ["content-agent-listing-fallback", photoAnalysis.reviewLabel, "needs-human-qa"],
       internal_notes:
-        `Photo QA: ${photoAnalysis.internalSummary} Uploaded photos are reused as processed photos; no Nano Banana or AI listing call has run yet.`,
+        `Photo QA: ${photoAnalysis.internalSummary} Deterministic listing fallback used; uploaded photos are reused as processed photos and Nano Banana has not run yet.`,
     },
     platform_specific: {
       depop: {
@@ -546,7 +648,7 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
     },
     agent_metadata: {
       agent_version: AGENT_VERSION,
-      model: MODEL,
+      model: FALLBACK_MODEL,
       confidence: {
         title: 0.7,
         description: 0.68,
@@ -559,6 +661,20 @@ function buildAgentPayload(item: ParsedItem, now: string): GeneratedPayload {
       generated_at: now,
     },
   };
+
+  const listingAi = await generateListingAi(env, listingContext);
+  if (listingAi.ok) {
+    agentOutput = applyListingAiDraft(agentOutput, listingAi, listingContext);
+  } else {
+    agentFlags = unique([...agentFlags, listingAi.flag]);
+    agentOutput.agent_metadata.flags = agentFlags;
+    agentOutput.vendoo_form.internal_notes = truncate(
+      `${agentOutput.vendoo_form.internal_notes} Listing AI: ${listingAi.detail}.`,
+      2000
+    );
+  }
+
+  agentFlags = agentOutput.agent_metadata.flags;
 
   assertAgentOutputShape(agentOutput);
 
@@ -577,9 +693,9 @@ async function commitProcessed(
   now: string
 ): Promise<void> {
   const detail: Record<string, JsonValue> = {
-    photo_qa_worker: true,
+    listing_ai_worker: true,
     agent_version: AGENT_VERSION,
-    model: MODEL,
+    model: generated.agentOutput.agent_metadata.model,
     processed_photo_slots: Object.keys(generated.processedPhotos),
     flags: generated.agentFlags,
     photo_qa: toJsonValue({
@@ -591,6 +707,11 @@ async function commitProcessed(
       generated_output_raw_slots: generated.photoAnalysis.generatedOutputSlots,
       confidence: generated.photoAnalysis.qaConfidence,
       review_label: generated.photoAnalysis.reviewLabel,
+    }),
+    listing_ai: toJsonValue({
+      model: generated.agentOutput.agent_metadata.model,
+      prompt_version: LISTING_AI_PROMPT_VERSION,
+      generated: generated.agentFlags.includes("listing_ai_generated"),
     }),
   };
   if (item.imageFlags) detail.reprocess_image_flags = toJsonValue(item.imageFlags);
@@ -720,6 +841,385 @@ function pickPrimaryImage(
 function firstPhoto(value: string | string[] | undefined): string | null {
   if (!value) return null;
   return Array.isArray(value) ? value[0] ?? null : value;
+}
+
+async function generateListingAi(env: Env, context: ListingContext): Promise<ListingAiResult> {
+  const apiKey = env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return {
+      ok: false,
+      flag: "listing_ai_not_configured",
+      detail: "OPENAI_API_KEY is not configured; deterministic fallback used",
+    };
+  }
+
+  const model = cleanText(env.TT_LISTING_AI_MODEL, DEFAULT_LISTING_AI_MODEL, 80);
+  const timeoutMs = positiveInt(env.TT_LISTING_AI_TIMEOUT_MS, DEFAULT_LISTING_AI_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(buildListingAiRequest(model, context)),
+    });
+    const text = await res.text();
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        flag: "listing_ai_failed",
+        detail: `OpenAI Responses API returned ${res.status}: ${truncate(text, 220)}`,
+      };
+    }
+
+    const parsed = parseJson<Record<string, unknown>>(text, "OpenAI listing response");
+    const outputText = extractResponseText(parsed);
+    const draft = parseListingAiDraft(outputText);
+    return { ok: true, draft, model };
+  } catch (error) {
+    return {
+      ok: false,
+      flag: "listing_ai_failed",
+      detail: error instanceof Error ? truncate(error.message, 220) : truncate(String(error), 220),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function buildListingAiRequest(model: string, context: ListingContext): Record<string, unknown> {
+  const content: Record<string, unknown>[] = [
+    {
+      type: "input_text",
+      text: buildListingAiPrompt(context),
+    },
+  ];
+
+  for (const url of representativeImageUrls(context)) {
+    content.push({ type: "input_image", image_url: url, detail: "low" });
+  }
+
+  return {
+    model,
+    store: false,
+    input: [
+      {
+        role: "system",
+        content:
+          "You write concise, accurate resale listing drafts for Thread + Time, a curated vintage, thrift, and resale shop. Return only JSON matching the provided schema. Do not invent fabric content, flaws, brand, measurements, or era. If a detail is uncertain, keep the wording conservative and add a flag.",
+      },
+      {
+        role: "user",
+        content,
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "thread_time_listing_ai",
+        strict: true,
+        schema: LISTING_AI_RESPONSE_SCHEMA,
+      },
+    },
+    max_output_tokens: 1400,
+  };
+}
+
+function buildListingAiPrompt(context: ListingContext): string {
+  return JSON.stringify(
+    {
+      task:
+        "Generate improved listing copy and marketplace tags. Use the images only for cautious visual confirmation. Keep title <=80 chars, description <=500 chars, five Depop hashtags, and style tags <=3.",
+      brand_voice:
+        "Warm but concise. Vintage-resale expert, not hypey. Mention concrete item details, condition notes, measurements, and reasonable styling cues when supported.",
+      sku: context.sku,
+      category: context.category,
+      category_noun: context.config.noun,
+      poshmark_category_path: context.config.poshmarkCategoryPath,
+      intake: {
+        brand: context.brand,
+        item_name: context.itemName,
+        size_label: context.sizeLabel,
+        condition: context.condition,
+        material_primary: context.material,
+        purchase_price_cents: nonnegativeInt(context.intake.purchase_price_cents),
+        price_target_cents: nonnegativeInt(context.intake.price_target_cents),
+        damage_notes: cleanText(context.intake.damage_notes, "", 500),
+        flat_measurements: cleanText(context.intake.flat_measurements, "", 500),
+        era_guess: cleanText(context.intake.era_guess, "", 40),
+        source_tag: context.sourceTag,
+        style_tags: context.styleTags,
+        item_story: cleanText(context.intake.item_story, "", 500),
+        manual_title_override: cleanText(context.intake.manual_title_override, "", 80),
+      },
+      deterministic_starting_point: {
+        colors: context.colors,
+        tags: context.vendooTags,
+        title_pattern: "Brand + era/material/color + item name/category + size",
+      },
+      photo_qa: {
+        present_slots: context.photoAnalysis.presentSlots,
+        missing_recommended_slots: context.photoAnalysis.missingRecommendedSlots,
+        primary_slot: context.photoAnalysis.primarySlot,
+        flags: context.photoAnalysis.flags,
+      },
+      guardrails: [
+        "No unverifiable claims like rare, designer, silk, wool, handmade, deadstock, or flawless unless intake says so.",
+        "If damage_notes are present, mention them plainly in the description.",
+        "If flat_measurements are present, include them.",
+        "Do not include markdown, bullets, emojis, shipping promises, or platform policy claims.",
+        "Use controlled color values exactly as provided by the schema.",
+      ],
+    },
+    null,
+    2
+  );
+}
+
+const LISTING_AI_RESPONSE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "title",
+    "description",
+    "primary_color",
+    "secondary_color",
+    "tags",
+    "style_tags",
+    "depop_hashtags",
+    "internal_notes",
+    "confidence",
+    "flags",
+  ],
+  properties: {
+    title: { type: "string", minLength: 1, maxLength: 80 },
+    description: { type: "string", minLength: 1, maxLength: 500 },
+    primary_color: { type: "string", enum: COLOR_VALUES },
+    secondary_color: {
+      type: ["string", "null"],
+      enum: [...COLOR_VALUES, null],
+    },
+    tags: {
+      type: "array",
+      minItems: 1,
+      maxItems: 12,
+      items: { type: "string", minLength: 1, maxLength: 30 },
+    },
+    style_tags: {
+      type: "array",
+      minItems: 1,
+      maxItems: 3,
+      items: { type: "string", minLength: 1, maxLength: 30 },
+    },
+    depop_hashtags: {
+      type: "array",
+      minItems: 5,
+      maxItems: 5,
+      items: { type: "string", minLength: 1, maxLength: 30 },
+    },
+    internal_notes: { type: "string", maxLength: 500 },
+    confidence: {
+      type: "object",
+      additionalProperties: false,
+      required: ["title", "description", "color", "style_tags"],
+      properties: {
+        title: { type: "number", minimum: 0, maximum: 1 },
+        description: { type: "number", minimum: 0, maximum: 1 },
+        color: { type: "number", minimum: 0, maximum: 1 },
+        style_tags: { type: "number", minimum: 0, maximum: 1 },
+      },
+    },
+    flags: {
+      type: "array",
+      maxItems: 10,
+      items: { type: "string", minLength: 1, maxLength: 60 },
+    },
+  },
+};
+
+function applyListingAiDraft(
+  baseOutput: AgentOutput,
+  result: ListingAiSuccess,
+  context: ListingContext
+): AgentOutput {
+  const draft = result.draft;
+  const manualTitle = hasText(context.intake.manual_title_override);
+  const primaryColor = sanitizeColor(draft.primary_color, baseOutput.vendoo_form.primary_color);
+  const secondaryColor = sanitizeNullableColor(draft.secondary_color, baseOutput.vendoo_form.secondary_color, primaryColor);
+  const styleTags = sanitizeStyleTags(draft.style_tags, context.styleTags);
+  const tags = sanitizeTags(
+    [...draft.tags, ...styleTags, context.sourceTag, normalizeTag(context.category), normalizeTag(context.config.noun)],
+    baseOutput.vendoo_form.tags,
+    20
+  );
+  const depopHashtags = sanitizeHashtags(
+    draft.depop_hashtags,
+    baseOutput.platform_specific.depop.hashtags
+  );
+  const aiFlags = sanitizeFlags(draft.flags);
+  const flags = unique([
+    ...baseOutput.agent_metadata.flags,
+    "listing_ai_generated",
+    `listing_ai_prompt_${LISTING_AI_PROMPT_VERSION}`,
+    manualTitle ? "manual_title_override_preserved" : "",
+    ...aiFlags,
+  ]);
+  const internalNotes = truncate(
+    `Photo QA: ${context.photoAnalysis.internalSummary} Listing AI: ${cleanText(draft.internal_notes, "Generated conservative listing copy from intake and uploaded photos.", 500)} Nano Banana has not run yet.`,
+    2000
+  );
+
+  return {
+    ...baseOutput,
+    vendoo_form: {
+      ...baseOutput.vendoo_form,
+      title: manualTitle ? baseOutput.vendoo_form.title : cleanText(draft.title, baseOutput.vendoo_form.title, 80),
+      description: cleanText(draft.description, baseOutput.vendoo_form.description, 500),
+      primary_color: primaryColor,
+      secondary_color: secondaryColor,
+      tags,
+      vendoo_labels: ["content-agent-listing-ai", context.photoAnalysis.reviewLabel, "needs-human-qa"],
+      internal_notes: internalNotes,
+    },
+    platform_specific: {
+      ...baseOutput.platform_specific,
+      depop: {
+        ...baseOutput.platform_specific.depop,
+        hashtags: depopHashtags,
+        style_tags: styleTags,
+        colors: secondaryColor ? [primaryColor, secondaryColor] : [primaryColor],
+      },
+      poshmark: {
+        ...baseOutput.platform_specific.poshmark,
+        style_tags: styleTags,
+        colors: secondaryColor ? [primaryColor, secondaryColor] : [primaryColor],
+      },
+    },
+    agent_metadata: {
+      ...baseOutput.agent_metadata,
+      model: result.model,
+      confidence: {
+        ...baseOutput.agent_metadata.confidence,
+        title: manualTitle ? baseOutput.agent_metadata.confidence.title : clampConfidence(draft.confidence.title),
+        description: clampConfidence(draft.confidence.description),
+        color: clampConfidence(draft.confidence.color),
+        style_tags: clampConfidence(draft.confidence.style_tags),
+        listing_ai: 0.86,
+      },
+      flags,
+    },
+  };
+}
+
+function representativeImageUrls(context: ListingContext): string[] {
+  const preferredSlots = ["on_model_hero", "on_model_front", "flat_lay", "tag_label", "detail"];
+  const urls = preferredSlots
+    .map((slot) => firstPhoto(context.rawPhotos[slot]))
+    .filter((url): url is string => Boolean(url));
+  return unique([context.primaryImageUrl, ...urls, ...context.imageUrls]).slice(0, 5);
+}
+
+function extractResponseText(response: Record<string, unknown>): string {
+  if (typeof response.output_text === "string") return response.output_text;
+
+  const output = Array.isArray(response.output) ? response.output : [];
+  for (const item of output) {
+    if (!isPlainObject(item)) continue;
+    const content = Array.isArray(item.content) ? item.content : [];
+    for (const block of content) {
+      if (!isPlainObject(block)) continue;
+      if (typeof block.text === "string") return block.text;
+    }
+  }
+
+  throw new Error("OpenAI response did not include output text");
+}
+
+function parseListingAiDraft(text: string): ListingAiDraft {
+  const draft = parseJson<ListingAiDraft>(text, "listing AI JSON");
+  if (!isPlainObject(draft)) throw new Error("listing AI output must be an object");
+  assert(typeof draft.title === "string" && draft.title.trim().length > 0, "listing AI title missing");
+  assert(typeof draft.description === "string" && draft.description.trim().length > 0, "listing AI description missing");
+  assert(COLOR_VALUES.includes(draft.primary_color), "listing AI primary color invalid");
+  assert(draft.secondary_color === null || COLOR_VALUES.includes(draft.secondary_color), "listing AI secondary color invalid");
+  assert(Array.isArray(draft.tags), "listing AI tags missing");
+  assert(Array.isArray(draft.style_tags), "listing AI style tags missing");
+  assert(Array.isArray(draft.depop_hashtags) && draft.depop_hashtags.length === 5, "listing AI hashtags invalid");
+  assert(isPlainObject(draft.confidence), "listing AI confidence missing");
+  assert(Array.isArray(draft.flags), "listing AI flags missing");
+  return draft;
+}
+
+function sanitizeColor(value: unknown, fallback: Color): Color {
+  if (typeof value !== "string") return fallback;
+  const match = COLOR_VALUES.find((color) => color.toLowerCase() === value.toLowerCase());
+  return match ?? fallback;
+}
+
+function sanitizeNullableColor(value: unknown, fallback: Color | null, primary: Color): Color | null {
+  const color = value === null ? null : sanitizeColor(value, fallback ?? primary);
+  return color && color !== primary ? color : null;
+}
+
+function sanitizeStyleTags(values: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(values)) return fallback;
+  const tags = unique(
+    values
+      .map((value) => cleanText(value, "", 30).toLowerCase())
+      .filter(Boolean)
+  ).slice(0, 3);
+  return tags.length ? tags : fallback;
+}
+
+function sanitizeTags(values: unknown[], fallback: string[], maxItems: number): string[] {
+  const tags = unique(
+    values
+      .map((value) => cleanText(value, "", 30).toLowerCase())
+      .filter(Boolean)
+  ).slice(0, maxItems);
+  return tags.length ? tags : fallback;
+}
+
+function sanitizeHashtags(values: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(values)) return fallback;
+  const hashtags = unique(
+    values
+      .map((value) => normalizeTag(value))
+      .filter(Boolean)
+      .map((value) => value.slice(0, 30))
+  ).slice(0, 5);
+  while (hashtags.length < 5) {
+    hashtags.push(fallback[hashtags.length] ?? `threadtime${hashtags.length + 1}`);
+  }
+  return hashtags.slice(0, 5);
+}
+
+function sanitizeFlags(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return unique(
+    values
+      .map((value) =>
+        String(value ?? "")
+          .toLowerCase()
+          .replace(/[^a-z0-9_]+/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .slice(0, 60)
+      )
+      .filter(Boolean)
+      .map((value) => `listing_ai_${value}`)
+  ).slice(0, 10);
+}
+
+function clampConfidence(value: unknown): number {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0.5;
+  return Number(Math.min(1, Math.max(0, number)).toFixed(2));
 }
 
 function analyzePhotoSet(rawPhotos: RawPhotos, primarySlot: string | null, intake: IntakeJson): PhotoAnalysis {
@@ -1026,6 +1526,11 @@ function poshmarkCondition(condition: Condition): "Like New" | "Good" | "Fair" {
 function nonnegativeInt(value: unknown): number {
   const number = Number(value);
   return Number.isInteger(number) && number >= 0 ? number : 0;
+}
+
+function positiveInt(value: unknown, fallback: number): number {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
 function humanCondition(condition: string): string {
