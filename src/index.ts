@@ -883,7 +883,7 @@ async function processImages(
   now: string
 ): Promise<ImageProcessingResult> {
   const model = cleanText(env.TT_IMAGE_PROCESSING_MODEL, DEFAULT_IMAGE_PROCESSING_MODEL, 100);
-  if (!truthy(env.TT_IMAGE_PROCESSING_ENABLED)) {
+  if (!imageProcessingEnabled(env)) {
     return {
       ok: false,
       enabled: false,
@@ -945,13 +945,14 @@ async function processImages(
       detail: "Nano Banana generated a Ghost Mannequin image from the uploaded Flat Lay photo.",
     };
   } catch (error) {
+    const failure = describeImageProcessingFailure(error);
     return {
       ok: false,
       enabled: true,
       model,
-      flags: ["processed_photos_reuse_raw_uploads", "image_processing_failed"],
+      flags: unique(["processed_photos_reuse_raw_uploads", "image_processing_failed", failure.flag]),
       generatedSlots: [],
-      detail: `Nano Banana failed: ${error instanceof Error ? truncate(error.message, 220) : truncate(String(error), 220)}. Uploaded photos were reused as processed photos.`,
+      detail: `Nano Banana failed: ${failure.detail} Uploaded photos were reused as processed photos.`,
     };
   } finally {
     clearTimeout(timeout);
@@ -1009,7 +1010,7 @@ async function callGeminiImageEdit(
   const text = await res.text();
 
   if (!res.ok) {
-    throw new Error(`Gemini image API returned ${res.status}: ${truncate(text, 220)}`);
+    throw new Error(`Gemini image API returned ${res.status}: ${geminiErrorMessage(text)}`);
   }
 
   const parsed = parseJson<Record<string, unknown>>(text, "Gemini image response");
@@ -1017,6 +1018,38 @@ async function callGeminiImageEdit(
   return {
     mimeType: generated.mimeType,
     bytes: base64ToArrayBuffer(generated.base64Data),
+  };
+}
+
+function geminiErrorMessage(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (
+      isPlainObject(parsed) &&
+      isPlainObject(parsed.error) &&
+      typeof parsed.error.message === "string"
+    ) {
+      return truncate(parsed.error.message, 220);
+    }
+  } catch {
+    // Fall through to the raw body preview.
+  }
+  return truncate(text, 220);
+}
+
+function describeImageProcessingFailure(error: unknown): { flag: string; detail: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  if (normalized.includes("429") || normalized.includes("quota")) {
+    return {
+      flag: "image_processing_quota_exceeded",
+      detail:
+        "Gemini returned 429 quota exceeded. Check Google AI Studio/Gemini API billing and quota for this API key.",
+    };
+  }
+  return {
+    flag: "image_processing_provider_error",
+    detail: truncate(message, 220),
   };
 }
 
@@ -1821,8 +1854,22 @@ function positiveInt(value: unknown, fallback: number): number {
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
-function truthy(value: unknown): boolean {
-  return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
+function imageProcessingEnabled(env: Env): boolean {
+  const configured = normalizeBooleanLike(env.TT_IMAGE_PROCESSING_ENABLED);
+  if (configured === true || configured === false) return configured;
+  return Boolean(env.GEMINI_API_KEY);
+}
+
+function normalizeBooleanLike(value: unknown): boolean | null {
+  const normalized = String(value ?? "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return null;
+  if (["1", "true", "yes", "on", "enabled"].includes(normalized)) return true;
+  if (["0", "false", "no", "off", "disabled"].includes(normalized)) return false;
+  return null;
 }
 
 function humanCondition(condition: string): string {
