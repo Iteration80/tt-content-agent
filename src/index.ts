@@ -9,6 +9,10 @@ interface Env {
   ANTHROPIC_API_KEY?: string;
   TT_LISTING_AI_MODEL?: string;
   TT_LISTING_AI_TIMEOUT_MS?: string;
+  GEMINI_API_KEY?: string;
+  TT_IMAGE_PROCESSING_ENABLED?: string;
+  TT_IMAGE_PROCESSING_MODEL?: string;
+  TT_IMAGE_PROCESSING_TIMEOUT_MS?: string;
 }
 
 interface ExecutionContextLike {
@@ -65,6 +69,7 @@ interface GeneratedPayload {
   agentOutput: AgentOutput;
   agentFlags: string[];
   photoAnalysis: PhotoAnalysis;
+  imageProcessing: ImageProcessingResult;
 }
 
 interface PhotoAnalysis {
@@ -104,6 +109,16 @@ interface ListingContext {
   imageUrls: string[];
   primaryImageUrl: string;
   rawPhotos: RawPhotos;
+  imageProcessingSummary: string;
+}
+
+interface ImageProcessingResult {
+  ok: boolean;
+  enabled: boolean;
+  model: string;
+  flags: string[];
+  generatedSlots: string[];
+  detail: string;
 }
 
 interface ListingAiDraft {
@@ -253,6 +268,10 @@ const ANTHROPIC_VERSION = "2023-06-01";
 const LISTING_AI_PROMPT_VERSION = "listing-ai-prompt-v1";
 const DEFAULT_LISTING_AI_TIMEOUT_MS = 20_000;
 const LISTING_AI_TOOL_NAME = "emit_listing_draft";
+const DEFAULT_IMAGE_PROCESSING_MODEL = "gemini-2.5-flash-image";
+const GEMINI_GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+const IMAGE_PROCESSING_PROMPT_VERSION = "nano-banana-ghost-mannequin-v1";
+const DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS = 45_000;
 
 const RECOMMENDED_PHOTO_SLOTS = [
   "detail",
@@ -573,13 +592,14 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
     .filter(Boolean)
     .slice(0, 20);
   const processedPhotos = copyRawPhotos(rawPhotos);
+  const imageProcessing = await processImages(env, item, processedPhotos, now);
   const imageUrls = flattenPhotoUrls(processedPhotos);
   const primaryImage = pickPrimaryImage(processedPhotos, config.hero, imageUrls);
 
   if (!primaryImage) throw new Error("processed_photos produced no media URLs");
 
   const photoAnalysis = analyzePhotoSet(rawPhotos, primaryImage.slot, intake);
-  let agentFlags = buildAgentFlags(intake, item.imageFlags, photoAnalysis);
+  let agentFlags = unique([...buildAgentFlags(intake, item.imageFlags, photoAnalysis), ...imageProcessing.flags]);
   const title =
     typeof intake.manual_title_override === "string" && intake.manual_title_override.trim()
       ? truncate(intake.manual_title_override, 80)
@@ -604,6 +624,7 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
     imageUrls,
     primaryImageUrl: primaryImage.url,
     rawPhotos,
+    imageProcessingSummary: imageProcessing.detail,
   };
 
   let agentOutput: AgentOutput = {
@@ -626,7 +647,7 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
       cost_of_goods_cents: nonnegativeInt(intake.purchase_price_cents),
       vendoo_labels: ["content-agent-listing-fallback", photoAnalysis.reviewLabel, "needs-human-qa"],
       internal_notes:
-        `Photo QA: ${photoAnalysis.internalSummary} Deterministic listing fallback used; uploaded photos are reused as processed photos and Nano Banana has not run yet.`,
+        `Photo QA: ${photoAnalysis.internalSummary} Image processing: ${imageProcessing.detail} Deterministic listing fallback used.`,
     },
     platform_specific: {
       depop: {
@@ -658,6 +679,7 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
         price: 0.86,
         category_mapping: 0.9,
         photo_processing: photoAnalysis.qaConfidence,
+        image_processing: imageProcessing.ok ? 0.82 : 0.5,
       },
       flags: agentFlags,
       generated_at: now,
@@ -685,6 +707,7 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
     agentOutput,
     agentFlags,
     photoAnalysis,
+    imageProcessing,
   };
 }
 
@@ -714,6 +737,14 @@ async function commitProcessed(
       model: generated.agentOutput.agent_metadata.model,
       prompt_version: LISTING_AI_PROMPT_VERSION,
       generated: generated.agentFlags.includes("listing_ai_generated"),
+    }),
+    image_processing: toJsonValue({
+      enabled: generated.imageProcessing.enabled,
+      ok: generated.imageProcessing.ok,
+      model: generated.imageProcessing.model,
+      prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
+      generated_slots: generated.imageProcessing.generatedSlots,
+      detail: generated.imageProcessing.detail,
     }),
   };
   if (item.imageFlags) detail.reprocess_image_flags = toJsonValue(item.imageFlags);
@@ -843,6 +874,236 @@ function pickPrimaryImage(
 function firstPhoto(value: string | string[] | undefined): string | null {
   if (!value) return null;
   return Array.isArray(value) ? value[0] ?? null : value;
+}
+
+async function processImages(
+  env: Env,
+  item: ParsedItem,
+  processedPhotos: RawPhotos,
+  now: string
+): Promise<ImageProcessingResult> {
+  const model = cleanText(env.TT_IMAGE_PROCESSING_MODEL, DEFAULT_IMAGE_PROCESSING_MODEL, 100);
+  if (!truthy(env.TT_IMAGE_PROCESSING_ENABLED)) {
+    return {
+      ok: false,
+      enabled: false,
+      model,
+      flags: ["processed_photos_reuse_raw_uploads"],
+      generatedSlots: [],
+      detail: "Nano Banana is disabled; uploaded photos were reused as processed photos.",
+    };
+  }
+
+  const apiKey = env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return {
+      ok: false,
+      enabled: true,
+      model,
+      flags: ["processed_photos_reuse_raw_uploads", "image_processing_not_configured"],
+      generatedSlots: [],
+      detail: "Nano Banana is enabled but GEMINI_API_KEY is not configured; uploaded photos were reused as processed photos.",
+    };
+  }
+
+  const flatLayUrl = firstPhoto(item.rawPhotos.flat_lay);
+  if (!flatLayUrl) {
+    return {
+      ok: false,
+      enabled: true,
+      model,
+      flags: ["processed_photos_reuse_raw_uploads", "image_processing_skipped_missing_flat_lay"],
+      generatedSlots: [],
+      detail: "Nano Banana skipped Ghost Mannequin generation because no Flat Lay upload was available.",
+    };
+  }
+
+  const timeoutMs = positiveInt(env.TT_IMAGE_PROCESSING_TIMEOUT_MS, DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const source = await fetchImageInput(flatLayUrl, controller.signal);
+    const generated = await callGeminiImageEdit(apiKey, model, item, source, controller.signal);
+    const key = processedImageKey(item.sku, "ghost-mannequin", generated.mimeType, now);
+    await env.PHOTOS.put(key, generated.bytes, {
+      httpMetadata: { contentType: generated.mimeType },
+    });
+
+    processedPhotos.ghost_mannequin = `${IMAGE_PREFIX}${key}`;
+
+    return {
+      ok: true,
+      enabled: true,
+      model,
+      flags: [
+        "image_processing_nano_banana_v1",
+        `image_processing_prompt_${IMAGE_PROCESSING_PROMPT_VERSION}`,
+        "processed_photos_include_generated_ghost_mannequin",
+      ],
+      generatedSlots: ["ghost_mannequin"],
+      detail: "Nano Banana generated a Ghost Mannequin image from the uploaded Flat Lay photo.",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      enabled: true,
+      model,
+      flags: ["processed_photos_reuse_raw_uploads", "image_processing_failed"],
+      generatedSlots: [],
+      detail: `Nano Banana failed: ${error instanceof Error ? truncate(error.message, 220) : truncate(String(error), 220)}. Uploaded photos were reused as processed photos.`,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchImageInput(
+  url: string,
+  signal: AbortSignal
+): Promise<{ mimeType: string; base64Data: string }> {
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`Could not fetch source image ${res.status}`);
+
+  const contentType = sanitizeImageMimeType(res.headers.get("content-type"), url);
+  const bytes = await res.arrayBuffer();
+  return {
+    mimeType: contentType,
+    base64Data: arrayBufferToBase64(bytes),
+  };
+}
+
+async function callGeminiImageEdit(
+  apiKey: string,
+  model: string,
+  item: ParsedItem,
+  source: { mimeType: string; base64Data: string },
+  signal: AbortSignal
+): Promise<{ mimeType: string; bytes: ArrayBuffer }> {
+  const res = await fetch(`${GEMINI_GENERATE_CONTENT_BASE_URL}/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    signal,
+    headers: {
+      "x-goog-api-key": apiKey,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: buildGhostMannequinPrompt(item) },
+            {
+              inline_data: {
+                mime_type: source.mimeType,
+                data: source.base64Data,
+              },
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseModalities: ["Image"],
+      },
+    }),
+  });
+  const text = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`Gemini image API returned ${res.status}: ${truncate(text, 220)}`);
+  }
+
+  const parsed = parseJson<Record<string, unknown>>(text, "Gemini image response");
+  const generated = extractGeneratedImage(parsed);
+  return {
+    mimeType: generated.mimeType,
+    bytes: base64ToArrayBuffer(generated.base64Data),
+  };
+}
+
+function buildGhostMannequinPrompt(item: ParsedItem): string {
+  const itemName = cleanText(item.intake.item_name, item.config.noun, 120);
+  return [
+    `Create one clean ecommerce Ghost Mannequin product image for this ${item.category.toLowerCase()} (${itemName}) using the provided Flat Lay photo as the only source of truth.`,
+    "Preserve the exact garment, silhouette, color, fabric texture, print, buttons, labels, seams, wear, and visible flaws.",
+    "Remove the original background and present the item centered, upright, and evenly lit on a warm off-white studio background.",
+    "Use a hollow/ghost-mannequin effect only when it fits the garment; otherwise create the closest clean product image from the original garment.",
+    "Do not add a person, face, body parts, accessories, hanger, text, logos, props, or invented design details.",
+  ].join(" ");
+}
+
+function extractGeneratedImage(response: Record<string, unknown>): { mimeType: string; base64Data: string } {
+  const candidates = Array.isArray(response.candidates) ? response.candidates : [];
+  for (const candidate of candidates) {
+    if (!isPlainObject(candidate) || !isPlainObject(candidate.content)) continue;
+    const parts = Array.isArray(candidate.content.parts) ? candidate.content.parts : [];
+    for (const part of parts) {
+      if (!isPlainObject(part)) continue;
+      const inlineData = isPlainObject(part.inlineData)
+        ? part.inlineData
+        : isPlainObject(part.inline_data)
+          ? part.inline_data
+          : null;
+      if (!inlineData) continue;
+      const data = inlineData.data;
+      if (typeof data !== "string" || data.length === 0) continue;
+      return {
+        mimeType: sanitizeImageMimeType(
+          typeof inlineData.mimeType === "string" ? inlineData.mimeType : inlineData.mime_type,
+          ""
+        ),
+        base64Data: data,
+      };
+    }
+  }
+
+  throw new Error("Gemini image response did not include image data");
+}
+
+function processedImageKey(sku: string, outputName: string, mimeType: string, now: string): string {
+  const safeSku = sku.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  const safeOutput = outputName.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  const stamp = now.replace(/[^0-9]/g, "").slice(0, 14);
+  return `${safeSku}/processed/${safeOutput}-${stamp}.${imageExtension(mimeType)}`;
+}
+
+function sanitizeImageMimeType(value: unknown, url: string): string {
+  const mimeType = typeof value === "string" ? value.split(";")[0].trim().toLowerCase() : "";
+  if (["image/jpeg", "image/png", "image/webp"].includes(mimeType)) return mimeType;
+  const pathname = (() => {
+    try {
+      return new URL(url).pathname.toLowerCase();
+    } catch {
+      return url.toLowerCase();
+    }
+  })();
+  if (pathname.endsWith(".png")) return "image/png";
+  if (pathname.endsWith(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+function imageExtension(mimeType: string): "jpg" | "png" | "webp" {
+  if (mimeType === "image/png") return "png";
+  if (mimeType === "image/webp") return "webp";
+  return "jpg";
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(data: string): ArrayBuffer {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
 }
 
 async function generateListingAi(env: Env, context: ListingContext): Promise<ListingAiResult> {
@@ -1102,7 +1363,7 @@ function applyListingAiDraft(
     ...aiFlags,
   ]);
   const internalNotes = truncate(
-    `Photo QA: ${context.photoAnalysis.internalSummary} Listing AI: ${cleanText(draft.internal_notes, "Generated conservative listing copy from intake and uploaded photos.", 500)} Nano Banana has not run yet.`,
+    `Photo QA: ${context.photoAnalysis.internalSummary} Image processing: ${context.imageProcessingSummary} Listing AI: ${cleanText(draft.internal_notes, "Generated conservative listing copy from intake and uploaded photos.", 500)}`,
     2000
   );
 
@@ -1558,6 +1819,10 @@ function nonnegativeInt(value: unknown): number {
 function positiveInt(value: unknown, fallback: number): number {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function truthy(value: unknown): boolean {
+  return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
 }
 
 function humanCondition(condition: string): string {

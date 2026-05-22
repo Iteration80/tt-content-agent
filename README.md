@@ -2,7 +2,7 @@
 
 Cloudflare Worker that claims submitted intake rows and moves them to review.
 
-This deployable version runs deterministic photo QA and, when configured, an AI listing pass. It reuses the real uploaded R2 photo URLs as `processed_photos`, checks uploaded photo slot coverage, asks the listing model for schema-constrained title/description/tag/color suggestions, and sets `status='needs_approval'`. If the AI key is missing or the call fails, it still produces a deterministic fallback listing so the intake/review flow stays usable.
+This deployable version runs deterministic photo QA, an optional Nano Banana image-processing pass, and, when configured, an AI listing pass. By default it reuses the real uploaded R2 photo URLs as `processed_photos`; when image processing is enabled, it generates a `ghost_mannequin` image from the uploaded `flat_lay` photo and stores it back in R2. It checks uploaded photo slot coverage, asks the listing model for schema-constrained title/description/tag/color suggestions, and sets `status='needs_approval'`. If an AI key is missing or a call fails, it still produces a deterministic fallback listing so the intake/review flow stays usable.
 
 ## Commands
 
@@ -31,6 +31,14 @@ Set `ANTHROPIC_API_KEY` to enable the AI listing pass. `TT_LISTING_AI_MODEL` is 
 ```bash
 npx wrangler secret put ANTHROPIC_API_KEY
 npx wrangler secret put TT_LISTING_AI_MODEL
+```
+
+Set `GEMINI_API_KEY` and `TT_IMAGE_PROCESSING_ENABLED=true` to enable Nano Banana image processing. `TT_IMAGE_PROCESSING_MODEL` is optional and defaults to `gemini-2.5-flash-image`; `TT_IMAGE_PROCESSING_TIMEOUT_MS` is optional and defaults to `45000`.
+
+```bash
+npx wrangler secret put GEMINI_API_KEY
+npx wrangler secret put TT_IMAGE_PROCESSING_ENABLED
+npx wrangler secret put TT_IMAGE_PROCESSING_MODEL
 ```
 
 The Pages app should include this service binding in `wrangler.jsonc`:
