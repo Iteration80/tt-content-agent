@@ -2,7 +2,7 @@
 
 Cloudflare Worker that claims submitted intake rows and moves them to review.
 
-This deployable version runs deterministic photo QA, an optional Nano Banana image-processing pass, and, when configured, an AI listing pass. By default it reuses the real uploaded R2 photo URLs as `processed_photos`; when image processing is enabled, it generates a `ghost_mannequin` image from the uploaded `flat_lay` photo and stores it back in R2. It checks uploaded photo slot coverage, asks the listing model for schema-constrained title/description/tag/color suggestions, and sets `status='needs_approval'`. If an AI key is missing or a call fails, it still produces a deterministic fallback listing so the intake/review flow stays usable.
+This deployable version runs deterministic photo QA, an optional Nano Banana image-processing pass, and, when configured, an AI listing pass. By default it reuses the real uploaded R2 photo URLs as `processed_photos`; when image processing is enabled and the branded reference images are configured, it processes every supported uploaded still-photo slot, generates `ghost_mannequin` from `flat_lay`, and stores the outputs back in R2. It checks uploaded photo slot coverage, asks the listing model for schema-constrained title/description/tag/color suggestions, and sets `status='needs_approval'`. If an AI key, reference asset, or provider call is missing/failing, it still produces a deterministic fallback listing so the intake/review flow stays usable.
 
 ## Commands
 
@@ -33,11 +33,13 @@ npx wrangler secret put ANTHROPIC_API_KEY
 npx wrangler secret put TT_LISTING_AI_MODEL
 ```
 
-Set `GEMINI_API_KEY` and `TT_IMAGE_PROCESSING_ENABLED=true` to enable Nano Banana image processing. `TT_IMAGE_PROCESSING_MODEL` is optional and defaults to `gemini-2.5-flash-image`; `TT_IMAGE_PROCESSING_TIMEOUT_MS` is optional and defaults to `45000`.
+Set `GEMINI_API_KEY`, `TT_IMAGE_PROCESSING_ENABLED=true`, `TT_IMAGE_REFERENCE_BACKGROUND_URL`, and `TT_IMAGE_REFERENCE_LOGO_URL` to enable Nano Banana image processing. The reference URLs should point to public R2 URLs for the prompt database `@img2` branded background and `@img3`/`@img_logo_ref` logo image. `TT_IMAGE_PROCESSING_MODEL` is optional and defaults to `gemini-2.5-flash-image`; `TT_IMAGE_PROCESSING_TIMEOUT_MS` is optional and defaults to `45000` per image-generation call.
 
 ```bash
 npx wrangler secret put GEMINI_API_KEY
 npx wrangler secret put TT_IMAGE_PROCESSING_ENABLED
+npx wrangler secret put TT_IMAGE_REFERENCE_BACKGROUND_URL
+npx wrangler secret put TT_IMAGE_REFERENCE_LOGO_URL
 npx wrangler secret put TT_IMAGE_PROCESSING_MODEL
 ```
 

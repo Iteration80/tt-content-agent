@@ -13,6 +13,8 @@ interface Env {
   TT_IMAGE_PROCESSING_ENABLED?: string;
   TT_IMAGE_PROCESSING_MODEL?: string;
   TT_IMAGE_PROCESSING_TIMEOUT_MS?: string;
+  TT_IMAGE_REFERENCE_BACKGROUND_URL?: string;
+  TT_IMAGE_REFERENCE_LOGO_URL?: string;
 }
 
 interface ExecutionContextLike {
@@ -119,6 +121,28 @@ interface ImageProcessingResult {
   flags: string[];
   generatedSlots: string[];
   detail: string;
+}
+
+interface ImageInput {
+  mimeType: string;
+  base64Data: string;
+}
+
+interface ImageReferenceSet {
+  background: ImageInput;
+  logo: ImageInput;
+}
+
+type ImagePromptKind = "on_model_original" | "product" | "ghost_mannequin";
+
+interface ImageProcessingJob {
+  sourceSlot: string;
+  sourceIndex: number;
+  outputSlot: string;
+  outputName: string;
+  sourceUrl: string;
+  promptKind: ImagePromptKind;
+  includeLogoReference: boolean;
 }
 
 interface ListingAiDraft {
@@ -270,7 +294,7 @@ const DEFAULT_LISTING_AI_TIMEOUT_MS = 20_000;
 const LISTING_AI_TOOL_NAME = "emit_listing_draft";
 const DEFAULT_IMAGE_PROCESSING_MODEL = "gemini-2.5-flash-image";
 const GEMINI_GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
-const IMAGE_PROCESSING_PROMPT_VERSION = "nano-banana-ghost-mannequin-v1";
+const IMAGE_PROCESSING_PROMPT_VERSION = "nano-banana-prompt-db-v1";
 const DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS = 45_000;
 
 const RECOMMENDED_PHOTO_SLOTS = [
@@ -288,6 +312,41 @@ const LEGACY_SLOT_ALIASES: Record<string, string> = {
 };
 
 const GENERATED_OUTPUT_RAW_SLOTS = new Set(["ghost_mannequin", "hero_clean_bg", "hero_brand_bg", "lifestyle"]);
+
+const IMAGE_PROCESSING_UPLOAD_SLOTS = [
+  "damage",
+  "detail",
+  "flat_lay",
+  "hanger",
+  "on_model_back",
+  "on_model_front",
+  "on_model_hero",
+  "tag_label",
+];
+
+const ON_MODEL_ORIGINAL_PROMPT_SLOTS = new Set(["on_model_back", "on_model_front"]);
+
+const ON_MODEL_ORIGINAL_PROMPT = `Composite the model from @img1 into the Master Studio Set provided in @img2 (background and logo).
+
+CRITICAL FRAMING & CROP: Strictly replicate the exact framing, composition, pose, and cropping shown in @img1. Do not add feet, extend legs, or generate any anatomical elements not present in @img1. The final image boundaries must perfectly match @img1.
+
+CRITICAL MASTER SET PRESERVATION: Replace the original background with the exact light beige floor, backdrop wall, and horizontal fold (seam) from @img2, fitting it to the strict framing of @img1. Ensure the logo and text from @img2 (referenced perfectly in @img_logo_ref) is clearly visible in the lower right corner. If the strict framing or the model's body covers this area, you must superimpose the logo/text (with no background) directly over the model or garment in that corner.
+
+IDENTITY, FACE-RELIGHTING, & GARMENT PRESERVATION: CRITICAL: Strictly maintain the identity, facial structure, pose, expression, hair texture, and hairstyle of the specific model from @img1.
+
+To ensure seamless integration without character drift, relight the face and skin with a clean, neutral daylight color cast, shifting the warm tones of @img1 to neutral daylight. Utilize the wrapping softbox lighting to create very soft, flattering, and subtle definition across the facial structure, avoiding any harsh shadows.
+
+GARMENT PRESERVATION & LIGHTING: Relight the model's clothing and the scene with high-key, wrapping softbox studio lighting. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the garment. Do not apply dramatic lighting or contrast boosts that could crush the garment's color. High-end editorial studio photography, premium quality, true-to-life color representation.`;
+
+const PRODUCT_PROMPT = `Composite the product from @img1 into the Master Studio Set provided in @img2 (background and logo).
+
+CRITICAL FRAMING & CROP: Strictly replicate the exact framing, composition, and cropping shown in @img1. Ensure the product in @img1 is not cropped, cut off, warped, or significantly altered in any way. Do not add or generate any elements not present in @img1. The final image boundaries must perfectly match @img1.
+
+CRITICAL MASTER SET PRESERVATION: Replace the original background (wood floor, carpet, or backdrop) behind the item with the exact light beige floor, backdrop wall, and horizontal fold (seam) from @img2, fitting it to the strict framing of @img1. Ensure the logo and text from @img2 (referenced perfectly in @img_logo_ref) is clearly visible in the lower right corner. If the strict framing or the product covers this area, you must superimpose the logo/text (with no background; full transparency) directly over the product in that corner. Do NOT duplicate the LOGO. 
+
+PRODUCT PRESERVATION & LIGHTING: Relight the item and the scene with high-key, wrapping softbox studio lighting, applying very soft, feathered, and subtle shadows to ground the item naturally. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the item. Do not apply dramatic lighting, harsh shadows, or contrast boosts that could crush the item's color. High-end editorial studio photography, premium quality, true-to-life color representation, texture-enhancing composition. DO NOT ADD ANYTHING.`;
+
+const GHOST_MANNEQUIN_PROMPT = `Replace the background (wood floor, carpet or backdrop) behind the item in @img1 with @img2 (background with logo). Relight the item with high-key, wrapping softbox studio lighting, applying very soft, feathered, and subtle shadows. The item should be displayed in a refined 3D 'ghost mannequin' style, appearing as if worn by an invisible person to maintain its natural shape, elegant silhouette, and fluid drape. Front-facing eye-level perspective. Ensure the product in @img1 is not cropped, cut off, warped, or significantly altered. If the product covers the area where the logo should appear, superimpose only the logo with no background. Product shot, premium quality, true-to-life color representation, texture-enhancing composition. Editorial fashion presentation, luxurious fabric detail, high-resolution texture, visible fabric weave, clean crisp edges. 8k resolution, commercial luxury fashion catalog style. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the item. Do not apply dramatic lighting, harsh shadows, or contrast boosts that could crush the item's color. DO NOT ADD ANYTHING.`;
 
 const PHOTO_SLOT_LABELS: Record<string, string> = {
   damage: "Damage",
@@ -883,6 +942,7 @@ async function processImages(
   now: string
 ): Promise<ImageProcessingResult> {
   const model = cleanText(env.TT_IMAGE_PROCESSING_MODEL, DEFAULT_IMAGE_PROCESSING_MODEL, 100);
+  const rawReuseFlag = "processed_photos_include_raw_uploads";
   if (!imageProcessingEnabled(env)) {
     return {
       ok: false,
@@ -906,64 +966,211 @@ async function processImages(
     };
   }
 
-  const flatLayUrl = firstPhoto(item.rawPhotos.flat_lay);
-  if (!flatLayUrl) {
+  const jobs = buildImageProcessingJobs(item.rawPhotos);
+  if (jobs.length === 0) {
     return {
       ok: false,
       enabled: true,
       model,
-      flags: ["processed_photos_reuse_raw_uploads", "image_processing_skipped_missing_flat_lay"],
+      flags: ["processed_photos_reuse_raw_uploads", "image_processing_skipped_no_supported_photo_slots"],
       generatedSlots: [],
-      detail: "Nano Banana skipped Ghost Mannequin generation because no Flat Lay upload was available.",
+      detail: "Nano Banana found no supported still-photo upload slots to process.",
     };
   }
 
   const timeoutMs = positiveInt(env.TT_IMAGE_PROCESSING_TIMEOUT_MS, DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const source = await fetchImageInput(flatLayUrl, controller.signal);
-    const generated = await callGeminiImageEdit(apiKey, model, item, source, controller.signal);
-    const key = processedImageKey(item.sku, "ghost-mannequin", generated.mimeType, now);
-    await env.PHOTOS.put(key, generated.bytes, {
-      httpMetadata: { contentType: generated.mimeType },
-    });
-
-    processedPhotos.ghost_mannequin = `${IMAGE_PREFIX}${key}`;
-
-    return {
-      ok: true,
-      enabled: true,
-      model,
-      flags: [
-        "processed_photos_include_raw_uploads",
-        "image_processing_nano_banana_v1",
-        `image_processing_prompt_${IMAGE_PROCESSING_PROMPT_VERSION}`,
-        "processed_photos_include_generated_ghost_mannequin",
-      ],
-      generatedSlots: ["ghost_mannequin"],
-      detail: "Nano Banana generated a Ghost Mannequin image from the uploaded Flat Lay photo.",
-    };
-  } catch (error) {
-    const failure = describeImageProcessingFailure(error);
+  const references = await fetchImageReferences(env, timeoutMs);
+  if (!references.ok) {
     return {
       ok: false,
       enabled: true,
       model,
-      flags: unique(["processed_photos_reuse_raw_uploads", "image_processing_failed", failure.flag]),
+      flags: unique(["processed_photos_reuse_raw_uploads", ...references.flags]),
       generatedSlots: [],
-      detail: `Nano Banana failed: ${failure.detail} Uploaded photos were reused as processed photos.`,
+      detail: references.detail,
     };
+  }
+
+  const generatedSlots: string[] = [];
+  let generatedJobCount = 0;
+  const failedFlags: string[] = [];
+  const failedDetails: string[] = [];
+
+  for (const job of jobs) {
+    try {
+      const source = await withTimeout(timeoutMs, (signal) => fetchImageInput(job.sourceUrl, signal));
+      const prompt = buildImageProcessingPrompt(job.promptKind);
+      const generated = await withTimeout(timeoutMs, (signal) =>
+        callGeminiImageEdit(apiKey, model, prompt, source, references.references, job.includeLogoReference, signal)
+      );
+      const key = processedImageKey(item.sku, job.outputName, generated.mimeType, now);
+      await env.PHOTOS.put(key, generated.bytes, {
+        httpMetadata: { contentType: generated.mimeType },
+      });
+
+      setProcessedPhoto(processedPhotos, job, `${IMAGE_PREFIX}${key}`);
+      generatedJobCount += 1;
+      generatedSlots.push(job.outputSlot);
+    } catch (error) {
+      const failure = describeImageProcessingFailure(error);
+      failedFlags.push(failure.flag, `image_processing_failed_${normalizeTag(job.outputSlot)}`);
+      failedDetails.push(`${job.outputSlot}: ${failure.detail}`);
+    }
+  }
+
+  const uniqueGeneratedSlots = unique(generatedSlots);
+  const allGenerated = uniqueGeneratedSlots.length > 0 && failedDetails.length === 0;
+  const rawPhotosStillIncluded = generatedJobCount < jobs.length || usesAnyRawUpload(item.rawPhotos, processedPhotos);
+  const flags = unique([
+    uniqueGeneratedSlots.length > 0 && rawPhotosStillIncluded ? rawReuseFlag : "",
+    uniqueGeneratedSlots.length > 0 ? "image_processing_nano_banana_v2" : "",
+    uniqueGeneratedSlots.length > 0 ? `image_processing_prompt_${IMAGE_PROCESSING_PROMPT_VERSION}` : "",
+    uniqueGeneratedSlots.includes("ghost_mannequin") ? "processed_photos_include_generated_ghost_mannequin" : "",
+    allGenerated ? "image_processing_all_supported_slots_generated" : "",
+    uniqueGeneratedSlots.length > 0 && failedDetails.length > 0 ? "image_processing_partial" : "",
+    uniqueGeneratedSlots.length === 0 ? "image_processing_failed" : "",
+    ...failedFlags,
+  ]);
+
+  if (uniqueGeneratedSlots.length === 0) {
+    return {
+      ok: false,
+      enabled: true,
+      model,
+      flags: unique(["processed_photos_reuse_raw_uploads", ...flags]),
+      generatedSlots: [],
+      detail: `Nano Banana did not generate any processed photos. ${failedDetails.join(" ")}`,
+    };
+  }
+
+  return {
+    ok: allGenerated,
+    enabled: true,
+    model,
+    flags,
+    generatedSlots: uniqueGeneratedSlots,
+    detail:
+      failedDetails.length === 0
+        ? `Nano Banana processed ${uniqueGeneratedSlots.length} supported photo slot(s) with the prompt database reference images.`
+        : `Nano Banana processed ${uniqueGeneratedSlots.length} supported photo slot(s); ${failedDetails.length} job(s) reused uploads. ${failedDetails.join(" ")}`,
+  };
+}
+
+function buildImageProcessingJobs(rawPhotos: RawPhotos): ImageProcessingJob[] {
+  const jobs: ImageProcessingJob[] = [];
+  for (const slot of IMAGE_PROCESSING_UPLOAD_SLOTS) {
+    const value = rawPhotos[slot];
+    if (!value) continue;
+    const urls = Array.isArray(value) ? value : [value];
+    urls.forEach((url, index) => {
+      jobs.push({
+        sourceSlot: slot,
+        sourceIndex: index,
+        outputSlot: slot,
+        outputName: `${slot.replace(/_/g, "-")}${urls.length > 1 ? `-${index + 1}` : ""}`,
+        sourceUrl: url,
+        promptKind: ON_MODEL_ORIGINAL_PROMPT_SLOTS.has(slot) ? "on_model_original" : "product",
+        includeLogoReference: true,
+      });
+    });
+  }
+
+  const flatLayUrl = firstPhoto(rawPhotos.flat_lay);
+  if (flatLayUrl) {
+    jobs.push({
+      sourceSlot: "flat_lay",
+      sourceIndex: 0,
+      outputSlot: "ghost_mannequin",
+      outputName: "ghost-mannequin",
+      sourceUrl: flatLayUrl,
+      promptKind: "ghost_mannequin",
+      includeLogoReference: false,
+    });
+  }
+
+  return jobs;
+}
+
+async function fetchImageReferences(
+  env: Env,
+  timeoutMs: number
+): Promise<
+  | { ok: true; references: ImageReferenceSet }
+  | { ok: false; flags: string[]; detail: string }
+> {
+  const backgroundUrl = optionalUrl(env.TT_IMAGE_REFERENCE_BACKGROUND_URL);
+  const logoUrl = optionalUrl(env.TT_IMAGE_REFERENCE_LOGO_URL);
+  const missingFlags = [
+    backgroundUrl ? "" : "image_processing_reference_background_missing",
+    logoUrl ? "" : "image_processing_reference_logo_missing",
+  ];
+
+  if (!backgroundUrl || !logoUrl) {
+    return {
+      ok: false,
+      flags: missingFlags,
+      detail:
+        "Nano Banana is enabled, but the branded background and logo reference image URLs are not fully configured; uploaded photos were reused as processed photos.",
+    };
+  }
+
+  try {
+    const [background, logo] = await Promise.all([
+      withTimeout(timeoutMs, (signal) => fetchImageInput(backgroundUrl, signal)),
+      withTimeout(timeoutMs, (signal) => fetchImageInput(logoUrl, signal)),
+    ]);
+    return { ok: true, references: { background, logo } };
+  } catch (error) {
+    const failure = describeImageProcessingFailure(error);
+    return {
+      ok: false,
+      flags: ["image_processing_reference_fetch_failed", failure.flag],
+      detail: `Nano Banana could not fetch the branded reference images: ${failure.detail} Uploaded photos were reused as processed photos.`,
+    };
+  }
+}
+
+function setProcessedPhoto(processedPhotos: RawPhotos, job: ImageProcessingJob, publicUrl: string): void {
+  if (job.outputSlot !== job.sourceSlot) {
+    processedPhotos[job.outputSlot] = publicUrl;
+    return;
+  }
+
+  const current = processedPhotos[job.outputSlot];
+  if (Array.isArray(current)) {
+    const next = [...current];
+    next[job.sourceIndex] = publicUrl;
+    processedPhotos[job.outputSlot] = next;
+    return;
+  }
+
+  processedPhotos[job.outputSlot] = publicUrl;
+}
+
+function usesAnyRawUpload(rawPhotos: RawPhotos, processedPhotos: RawPhotos): boolean {
+  const rawUrls = new Set(flattenPhotoUrls(rawPhotos));
+  return flattenPhotoUrls(processedPhotos).some((url) => rawUrls.has(url));
+}
+
+async function withTimeout<T>(timeoutMs: number, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await task(controller.signal);
   } finally {
     clearTimeout(timeout);
   }
 }
 
+function optionalUrl(value: unknown): string | null {
+  const url = cleanText(value, "", 2000);
+  return url ? url : null;
+}
+
 async function fetchImageInput(
   url: string,
   signal: AbortSignal
-): Promise<{ mimeType: string; base64Data: string }> {
+): Promise<ImageInput> {
   const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`Could not fetch source image ${res.status}`);
 
@@ -978,10 +1185,42 @@ async function fetchImageInput(
 async function callGeminiImageEdit(
   apiKey: string,
   model: string,
-  item: ParsedItem,
-  source: { mimeType: string; base64Data: string },
+  prompt: string,
+  source: ImageInput,
+  references: ImageReferenceSet,
+  includeLogoReference: boolean,
   signal: AbortSignal
 ): Promise<{ mimeType: string; bytes: ArrayBuffer }> {
+  const parts: unknown[] = [
+    { text: prompt },
+    { text: "Reference @img1: source upload." },
+    {
+      inline_data: {
+        mime_type: source.mimeType,
+        data: source.base64Data,
+      },
+    },
+    { text: "Reference @img2: branded Master Studio Set background with logo." },
+    {
+      inline_data: {
+        mime_type: references.background.mimeType,
+        data: references.background.base64Data,
+      },
+    },
+  ];
+
+  if (includeLogoReference) {
+    parts.push(
+      { text: "Reference @img3 / @img_logo_ref: transparent Thread + Time logo reference." },
+      {
+        inline_data: {
+          mime_type: references.logo.mimeType,
+          data: references.logo.base64Data,
+        },
+      }
+    );
+  }
+
   const res = await fetch(`${GEMINI_GENERATE_CONTENT_BASE_URL}/${encodeURIComponent(model)}:generateContent`, {
     method: "POST",
     signal,
@@ -992,15 +1231,7 @@ async function callGeminiImageEdit(
     body: JSON.stringify({
       contents: [
         {
-          parts: [
-            { text: buildGhostMannequinPrompt(item) },
-            {
-              inline_data: {
-                mime_type: source.mimeType,
-                data: source.base64Data,
-              },
-            },
-          ],
+          parts,
         },
       ],
       generationConfig: {
@@ -1054,15 +1285,10 @@ function describeImageProcessingFailure(error: unknown): { flag: string; detail:
   };
 }
 
-function buildGhostMannequinPrompt(item: ParsedItem): string {
-  const itemName = cleanText(item.intake.item_name, item.config.noun, 120);
-  return [
-    `Create one clean ecommerce Ghost Mannequin product image for this ${item.category.toLowerCase()} (${itemName}) using the provided Flat Lay photo as the only source of truth.`,
-    "Preserve the exact garment, silhouette, color, fabric texture, print, buttons, labels, seams, wear, and visible flaws.",
-    "Remove the original background and present the item centered, upright, and evenly lit on a warm off-white studio background.",
-    "Use a hollow/ghost-mannequin effect only when it fits the garment; otherwise create the closest clean product image from the original garment.",
-    "Do not add a person, face, body parts, accessories, hanger, text, logos, props, or invented design details.",
-  ].join(" ");
+function buildImageProcessingPrompt(kind: ImagePromptKind): string {
+  if (kind === "on_model_original") return ON_MODEL_ORIGINAL_PROMPT;
+  if (kind === "ghost_mannequin") return GHOST_MANNEQUIN_PROMPT;
+  return PRODUCT_PROMPT;
 }
 
 function extractGeneratedImage(response: Record<string, unknown>): { mimeType: string; base64Data: string } {
