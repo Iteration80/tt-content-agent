@@ -937,6 +937,7 @@ async function processImages(
       enabled: true,
       model,
       flags: [
+        "processed_photos_include_raw_uploads",
         "image_processing_nano_banana_v1",
         `image_processing_prompt_${IMAGE_PROCESSING_PROMPT_VERSION}`,
         "processed_photos_include_generated_ghost_mannequin",
@@ -1779,7 +1780,7 @@ function buildDepopHashtags({
 }
 
 function buildAgentFlags(intake: IntakeJson, imageFlags: unknown, photoAnalysis: PhotoAnalysis): string[] {
-  const flags = ["worker_photo_qa_v1", "processed_photos_reuse_raw_uploads", ...photoAnalysis.flags];
+  const flags = ["worker_photo_qa_v1", ...photoAnalysis.flags];
   if (!intake.era_guess || intake.era_guess === "unknown") flags.push("era_defaulted_to_2000s");
   if (!Array.isArray(intake.style_tags) || intake.style_tags.length === 0) flags.push("style_tags_defaulted");
   if (!intake.source_tag) flags.push("source_tag_defaulted");
