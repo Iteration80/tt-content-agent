@@ -303,6 +303,7 @@ const DEFAULT_IMAGE_PROCESSING_MODEL = "gemini-2.5-flash-image";
 const GEMINI_GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const IMAGE_PROCESSING_PROMPT_VERSION = "nano-banana-prompt-db-v1";
 const DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS = 45_000;
+const STALE_PROCESSING_RETRY_MS = 10 * 60 * 1000;
 
 const RECOMMENDED_PHOTO_SLOTS = [
   "detail",
@@ -569,7 +570,8 @@ export default {
 
 async function processOne(env: Env, targetSku?: string): Promise<Record<string, JsonValue>> {
   const now = new Date().toISOString();
-  const row = await claimSubmittedItem(env, now, targetSku);
+  const staleBefore = new Date(Date.now() - STALE_PROCESSING_RETRY_MS).toISOString();
+  const row = await claimSubmittedItem(env, now, staleBefore, targetSku);
   if (!row) {
     return { ok: true, processed: false, status: "idle", sku: targetSku ?? null };
   }
@@ -593,7 +595,12 @@ async function processOne(env: Env, targetSku?: string): Promise<Record<string, 
   }
 }
 
-async function claimSubmittedItem(env: Env, now: string, targetSku?: string): Promise<SubmittedRow | null> {
+async function claimSubmittedItem(
+  env: Env,
+  now: string,
+  staleBefore: string,
+  targetSku?: string
+): Promise<SubmittedRow | null> {
   const baseSelect =
     "sku, category, intake_json, raw_photos, image_flags";
 
@@ -602,10 +609,11 @@ async function claimSubmittedItem(env: Env, now: string, targetSku?: string): Pr
       .prepare(
         `UPDATE items
          SET status = 'processing', updated_at = ?1, error = NULL
-         WHERE sku = ?2 AND status = 'submitted'
+         WHERE sku = ?2
+           AND (status = 'submitted' OR (status = 'processing' AND updated_at < ?3))
          RETURNING ${baseSelect}`
       )
-      .bind(now, targetSku)
+      .bind(now, targetSku, staleBefore)
       .first<SubmittedRow>();
   }
 
@@ -615,14 +623,14 @@ async function claimSubmittedItem(env: Env, now: string, targetSku?: string): Pr
        SET status = 'processing', updated_at = ?1, error = NULL
        WHERE sku = (
          SELECT sku FROM items
-         WHERE status = 'submitted'
-         ORDER BY updated_at ASC
+         WHERE status = 'submitted' OR (status = 'processing' AND updated_at < ?2)
+         ORDER BY CASE WHEN status = 'submitted' THEN 0 ELSE 1 END, updated_at ASC
          LIMIT 1
        )
-       AND status = 'submitted'
+       AND (status = 'submitted' OR (status = 'processing' AND updated_at < ?2))
        RETURNING ${baseSelect}`
     )
-    .bind(now)
+    .bind(now, staleBefore)
     .first<SubmittedRow>();
 }
 
@@ -1063,51 +1071,7 @@ async function processImages(
   const uniqueGeneratedSlots = unique(generatedSlots);
   const allGenerated = uniqueGeneratedSlots.length > 0 && failedDetails.length === 0;
   const generatedJobCount = results.filter((result) => result.ok).length;
-  const successfulResults = results.filter((result) => result.ok);
-  const squareResults = await Promise.all(
-    successfulResults.map((result) =>
-      processSquareImageJob(env, apiKey, model, item.sku, result.job, result.sourceForSquare, timeoutMs, now)
-    )
-  );
-  const squareGeneratedSlots: string[] = [];
-  const squareFailedFlags: string[] = [];
-  const squareFailedDetails: string[] = [];
-
-  for (const result of squareResults) {
-    if (result.ok) {
-      setProcessedPhoto(squarePhotos, result.job, result.publicUrl);
-      squareGeneratedSlots.push(result.job.outputSlot);
-      jobDetails.push(
-        toJsonValue({
-          slot: result.job.outputSlot,
-          source_slot: result.job.outputSlot,
-          prompt_kind: "square_reformat",
-          prompt_label: promptLabel("square_reformat"),
-          reference_urls: ["@img1: generated 3:4 processed image"],
-          output_url: result.publicUrl,
-          ok: true,
-        })
-      );
-    } else {
-      squareFailedFlags.push(result.failure.flag, `image_processing_square_failed_${normalizeTag(result.job.outputSlot)}`);
-      squareFailedDetails.push(`${result.job.outputSlot}: ${result.failure.detail}`);
-      jobDetails.push(
-        toJsonValue({
-          slot: result.job.outputSlot,
-          source_slot: result.job.outputSlot,
-          prompt_kind: "square_reformat",
-          prompt_label: promptLabel("square_reformat"),
-          reference_urls: ["@img1: generated 3:4 processed image"],
-          ok: false,
-          failure: result.failure.detail,
-        })
-      );
-    }
-  }
-
-  const uniqueSquareGeneratedSlots = unique(squareGeneratedSlots);
-  const allSquaresGenerated =
-    generatedJobCount > 0 && uniqueSquareGeneratedSlots.length > 0 && squareFailedDetails.length === 0;
+  const uniqueSquareGeneratedSlots: string[] = [];
   const rawPhotosStillIncluded = generatedJobCount < jobs.length || usesAnyRawUpload(item.rawPhotos, processedPhotos);
   const flags = unique([
     uniqueGeneratedSlots.length > 0 && rawPhotosStillIncluded ? rawReuseFlag : "",
@@ -1115,13 +1079,10 @@ async function processImages(
     uniqueGeneratedSlots.length > 0 ? `image_processing_prompt_${IMAGE_PROCESSING_PROMPT_VERSION}` : "",
     uniqueGeneratedSlots.includes("ghost_mannequin") ? "processed_photos_include_generated_ghost_mannequin" : "",
     allGenerated ? "image_processing_all_supported_slots_generated" : "",
-    uniqueSquareGeneratedSlots.length > 0 ? "image_processing_square_v1" : "",
-    allSquaresGenerated ? "image_processing_square_all_supported_slots_generated" : "",
+    uniqueGeneratedSlots.length > 0 ? "image_processing_square_deferred" : "",
     uniqueGeneratedSlots.length > 0 && failedDetails.length > 0 ? "image_processing_partial" : "",
-    uniqueSquareGeneratedSlots.length > 0 && squareFailedDetails.length > 0 ? "image_processing_square_partial" : "",
     uniqueGeneratedSlots.length === 0 ? "image_processing_failed" : "",
     ...failedFlags,
-    ...squareFailedFlags,
   ]);
 
   if (uniqueGeneratedSlots.length === 0) {
@@ -1139,7 +1100,7 @@ async function processImages(
   }
 
   return {
-    ok: allGenerated && allSquaresGenerated,
+    ok: allGenerated,
     enabled: true,
     model,
     flags,
@@ -1148,9 +1109,9 @@ async function processImages(
     squarePhotos,
     jobDetails,
     detail:
-      failedDetails.length === 0 && squareFailedDetails.length === 0
-        ? `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s) and ${uniqueSquareGeneratedSlots.length} square derivative slot(s) with the prompt database reference images.`
-        : `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s) and ${uniqueSquareGeneratedSlots.length} square derivative slot(s); ${failedDetails.length + squareFailedDetails.length} job(s) need review. ${[...failedDetails, ...squareFailedDetails].join(" ")}`,
+      failedDetails.length === 0
+        ? `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s) with the prompt database reference images. Square derivatives are deferred so review is not blocked.`
+        : `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s); ${failedDetails.length} job(s) reused uploads. Square derivatives are deferred so review is not blocked. ${failedDetails.join(" ")}`,
   };
 }
 
