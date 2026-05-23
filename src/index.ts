@@ -991,35 +991,27 @@ async function processImages(
     };
   }
 
+  const results = await Promise.all(
+    jobs.map((job) => processImageJob(env, apiKey, model, item.sku, job, references.references, timeoutMs, now))
+  );
+
   const generatedSlots: string[] = [];
-  let generatedJobCount = 0;
   const failedFlags: string[] = [];
   const failedDetails: string[] = [];
 
-  for (const job of jobs) {
-    try {
-      const source = await withTimeout(timeoutMs, (signal) => fetchImageInput(job.sourceUrl, signal));
-      const prompt = buildImageProcessingPrompt(job.promptKind);
-      const generated = await withTimeout(timeoutMs, (signal) =>
-        callGeminiImageEdit(apiKey, model, prompt, source, references.references, job.includeLogoReference, signal)
-      );
-      const key = processedImageKey(item.sku, job.outputName, generated.mimeType, now);
-      await env.PHOTOS.put(key, generated.bytes, {
-        httpMetadata: { contentType: generated.mimeType },
-      });
-
-      setProcessedPhoto(processedPhotos, job, `${IMAGE_PREFIX}${key}`);
-      generatedJobCount += 1;
-      generatedSlots.push(job.outputSlot);
-    } catch (error) {
-      const failure = describeImageProcessingFailure(error);
-      failedFlags.push(failure.flag, `image_processing_failed_${normalizeTag(job.outputSlot)}`);
-      failedDetails.push(`${job.outputSlot}: ${failure.detail}`);
+  for (const result of results) {
+    if (result.ok) {
+      setProcessedPhoto(processedPhotos, result.job, result.publicUrl);
+      generatedSlots.push(result.job.outputSlot);
+    } else {
+      failedFlags.push(result.failure.flag, `image_processing_failed_${normalizeTag(result.job.outputSlot)}`);
+      failedDetails.push(`${result.job.outputSlot}: ${result.failure.detail}`);
     }
   }
 
   const uniqueGeneratedSlots = unique(generatedSlots);
   const allGenerated = uniqueGeneratedSlots.length > 0 && failedDetails.length === 0;
+  const generatedJobCount = results.filter((result) => result.ok).length;
   const rawPhotosStillIncluded = generatedJobCount < jobs.length || usesAnyRawUpload(item.rawPhotos, processedPhotos);
   const flags = unique([
     uniqueGeneratedSlots.length > 0 && rawPhotosStillIncluded ? rawReuseFlag : "",
@@ -1054,6 +1046,35 @@ async function processImages(
         ? `Nano Banana processed ${uniqueGeneratedSlots.length} supported photo slot(s) with the prompt database reference images.`
         : `Nano Banana processed ${uniqueGeneratedSlots.length} supported photo slot(s); ${failedDetails.length} job(s) reused uploads. ${failedDetails.join(" ")}`,
   };
+}
+
+async function processImageJob(
+  env: Env,
+  apiKey: string,
+  model: string,
+  sku: string,
+  job: ImageProcessingJob,
+  references: ImageReferenceSet,
+  timeoutMs: number,
+  now: string
+): Promise<
+  | { ok: true; job: ImageProcessingJob; publicUrl: string }
+  | { ok: false; job: ImageProcessingJob; failure: { flag: string; detail: string } }
+> {
+  try {
+    const source = await withTimeout(timeoutMs, (signal) => fetchImageInput(job.sourceUrl, signal));
+    const prompt = buildImageProcessingPrompt(job.promptKind);
+    const generated = await withTimeout(timeoutMs, (signal) =>
+      callGeminiImageEdit(apiKey, model, prompt, source, references, job.includeLogoReference, signal)
+    );
+    const key = processedImageKey(sku, job.outputName, generated.mimeType, now);
+    await env.PHOTOS.put(key, generated.bytes, {
+      httpMetadata: { contentType: generated.mimeType },
+    });
+    return { ok: true, job, publicUrl: `${IMAGE_PREFIX}${key}` };
+  } catch (error) {
+    return { ok: false, job, failure: describeImageProcessingFailure(error) };
+  }
 }
 
 function buildImageProcessingJobs(rawPhotos: RawPhotos): ImageProcessingJob[] {
