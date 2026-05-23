@@ -57,6 +57,14 @@ interface SubmittedRow {
   image_flags: string | null;
 }
 
+interface SquareCandidateRow {
+  sku: string;
+  category: Category;
+  processed_photos: string;
+  agent_output: string;
+  agent_flags: string | null;
+}
+
 interface ParsedItem {
   sku: string;
   category: Category;
@@ -224,6 +232,7 @@ interface AgentOutput {
     image_urls: string[];
     square_primary_image_url?: string;
     square_image_urls?: string[];
+    square_photos?: RawPhotos;
   };
   agent_metadata: {
     agent_version: string;
@@ -231,6 +240,7 @@ interface AgentOutput {
     confidence: Record<string, number>;
     flags: string[];
     generated_at: string;
+    image_processing_jobs?: JsonValue[];
   };
 }
 
@@ -546,7 +556,9 @@ export default {
       }
 
       try {
-        return json(await processOne(env, sku));
+        const result = await processOne(env, sku);
+        if (result.processed) return json(result);
+        return json(await processSquareDerivativesForOne(env, sku));
       } catch (error) {
         return err(500, "content agent failed", {
           detail: error instanceof Error ? error.message : String(error),
@@ -558,15 +570,22 @@ export default {
   },
 
   async scheduled(_event: ScheduledControllerLike, env: Env, ctx: ExecutionContextLike): Promise<void> {
-    ctx.waitUntil(
-      processOne(env).then((result) => {
-        if (result.processed) {
-          console.log(`Processed ${result.sku}`);
-        }
-      })
-    );
+    ctx.waitUntil(runScheduled(env));
   },
 };
+
+async function runScheduled(env: Env): Promise<void> {
+  const result = await processOne(env);
+  if (result.processed) {
+    console.log(`Processed ${result.sku}`);
+  }
+
+  const squareTarget = result.processed && typeof result.sku === "string" ? result.sku : undefined;
+  const squareResult = await processSquareDerivativesForOne(env, squareTarget);
+  if (squareResult.processed) {
+    console.log(`Generated square image derivatives for ${squareResult.sku}`);
+  }
+}
 
 async function processOne(env: Env, targetSku?: string): Promise<Record<string, JsonValue>> {
   const now = new Date().toISOString();
@@ -748,6 +767,7 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
       image_urls: imageUrls.slice(0, 24),
       square_primary_image_url: squarePrimaryImage?.url,
       square_image_urls: squareImageUrls.slice(0, 24),
+      square_photos: Object.keys(imageProcessing.squarePhotos).length > 0 ? imageProcessing.squarePhotos : undefined,
     },
     agent_metadata: {
       agent_version: AGENT_VERSION,
@@ -763,6 +783,7 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
       },
       flags: agentFlags,
       generated_at: now,
+      image_processing_jobs: imageProcessing.jobDetails,
     },
   };
 
@@ -1044,8 +1065,12 @@ async function processImages(
         toJsonValue({
           slot: result.job.outputSlot,
           source_slot: result.job.sourceSlot,
+          source_index: result.job.sourceIndex,
+          variant: "processed_3x4",
           prompt_kind: result.job.promptKind,
           prompt_label: promptLabel(result.job.promptKind),
+          prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
+          prompt_text: buildImageProcessingPrompt(result.job.promptKind),
           reference_urls: imageReferenceUrls(result.job, references.references),
           output_url: result.publicUrl,
           ok: true,
@@ -1058,8 +1083,12 @@ async function processImages(
         toJsonValue({
           slot: result.job.outputSlot,
           source_slot: result.job.sourceSlot,
+          source_index: result.job.sourceIndex,
+          variant: "processed_3x4",
           prompt_kind: result.job.promptKind,
           prompt_label: promptLabel(result.job.promptKind),
+          prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
+          prompt_text: buildImageProcessingPrompt(result.job.promptKind),
           reference_urls: imageReferenceUrls(result.job, references.references),
           ok: false,
           failure: result.failure.detail,
@@ -1113,6 +1142,217 @@ async function processImages(
         ? `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s) with the prompt database reference images. Square derivatives are deferred so review is not blocked.`
         : `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s); ${failedDetails.length} job(s) reused uploads. Square derivatives are deferred so review is not blocked. ${failedDetails.join(" ")}`,
   };
+}
+
+async function processSquareDerivativesForOne(
+  env: Env,
+  targetSku?: string
+): Promise<Record<string, JsonValue>> {
+  const now = new Date().toISOString();
+  const model = cleanText(env.TT_IMAGE_PROCESSING_MODEL, DEFAULT_IMAGE_PROCESSING_MODEL, 100);
+  if (!imageProcessingEnabled(env)) {
+    return { ok: true, processed: false, status: "idle_squares", reason: "image_processing_disabled", sku: targetSku ?? null };
+  }
+
+  const apiKey = env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return { ok: true, processed: false, status: "idle_squares", reason: "gemini_api_key_missing", sku: targetSku ?? null };
+  }
+
+  const row = await findSquareDerivativeCandidate(env, targetSku);
+  if (!row) {
+    return { ok: true, processed: false, status: "idle_squares", sku: targetSku ?? null };
+  }
+
+  assertCategory(row.category);
+  const processedPhotos = parseJson<RawPhotos>(row.processed_photos, "processed_photos");
+  if (!isRawPhotos(processedPhotos)) {
+    await markSquareDerivativeFailure(env, row, ["image_processing_square_invalid_processed_photos"], now, []);
+    return { ok: false, processed: false, status: "square_failed", sku: row.sku };
+  }
+
+  const agentOutput = parseJson<AgentOutput>(row.agent_output, "agent_output");
+  assertAgentOutputShape(agentOutput);
+  const existingSquarePhotos = isRawPhotos(agentOutput.media.square_photos) ? copyRawPhotos(agentOutput.media.square_photos) : {};
+  const jobs = buildSquareProcessingJobs(agentOutput, processedPhotos, existingSquarePhotos);
+  if (jobs.length === 0) {
+    return { ok: true, processed: false, status: "idle_squares", sku: row.sku, reason: "no_missing_square_slots" };
+  }
+
+  const timeoutMs = positiveInt(env.TT_IMAGE_PROCESSING_TIMEOUT_MS, DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS);
+  const results = await Promise.all(
+    jobs.map(async (job) => {
+      try {
+        const source = await withTimeout(timeoutMs, (signal) => fetchImageInput(job.sourceUrl, signal));
+        return await processSquareImageJob(env, apiKey, model, row.sku, job, source, timeoutMs, now);
+      } catch (error) {
+        return { ok: false as const, job, failure: describeImageProcessingFailure(error) };
+      }
+    })
+  );
+
+  const generatedSlots: string[] = [];
+  const failedFlags: string[] = [];
+  const failedDetails: string[] = [];
+  const jobDetails: JsonValue[] = [];
+  const squarePhotos = copyRawPhotos(existingSquarePhotos);
+
+  for (const result of results) {
+    if (result.ok) {
+      setProcessedPhoto(squarePhotos, result.job, result.publicUrl);
+      generatedSlots.push(result.job.outputSlot);
+      jobDetails.push(
+        toJsonValue({
+          slot: result.job.outputSlot,
+          source_slot: result.job.sourceSlot,
+          source_index: result.job.sourceIndex,
+          variant: "square_1x1",
+          prompt_kind: result.job.promptKind,
+          prompt_label: promptLabel(result.job.promptKind),
+          prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
+          prompt_text: buildImageProcessingPrompt(result.job.promptKind),
+          reference_urls: squareImageReferenceUrls(result.job),
+          output_url: result.publicUrl,
+          ok: true,
+        })
+      );
+    } else {
+      failedFlags.push(result.failure.flag, `image_processing_square_failed_${normalizeTag(result.job.outputSlot)}`);
+      failedDetails.push(`${result.job.outputSlot}: ${result.failure.detail}`);
+      jobDetails.push(
+        toJsonValue({
+          slot: result.job.outputSlot,
+          source_slot: result.job.sourceSlot,
+          source_index: result.job.sourceIndex,
+          variant: "square_1x1",
+          prompt_kind: result.job.promptKind,
+          prompt_label: promptLabel(result.job.promptKind),
+          prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
+          prompt_text: buildImageProcessingPrompt(result.job.promptKind),
+          reference_urls: squareImageReferenceUrls(result.job),
+          ok: false,
+          failure: result.failure.detail,
+        })
+      );
+    }
+  }
+
+  const uniqueGeneratedSlots = unique(generatedSlots);
+  const squareImageUrls = flattenPhotoUrls(squarePhotos);
+  const squarePrimaryImage = pickPrimaryImage(squarePhotos, CATEGORY_CONFIG[row.category].hero, squareImageUrls);
+  const existingFlags = parseStringArray(row.agent_flags);
+  const flags = unique([
+    ...existingFlags,
+    uniqueGeneratedSlots.length > 0 ? "image_processing_square_v1" : "",
+    uniqueGeneratedSlots.length > 0 ? `image_processing_square_prompt_${IMAGE_PROCESSING_PROMPT_VERSION}` : "",
+    uniqueGeneratedSlots.length === jobs.length ? "image_processing_square_all_supported_slots_generated" : "",
+    uniqueGeneratedSlots.length > 0 && failedDetails.length > 0 ? "image_processing_square_partial" : "",
+    uniqueGeneratedSlots.length === 0 ? "image_processing_square_failed" : "",
+    ...failedFlags,
+  ]);
+  const allJobs = [...(agentOutput.agent_metadata.image_processing_jobs ?? []), ...jobDetails];
+  const nextOutput: AgentOutput = {
+    ...agentOutput,
+    media: {
+      ...agentOutput.media,
+      square_primary_image_url: squarePrimaryImage?.url ?? agentOutput.media.square_primary_image_url,
+      square_image_urls: squareImageUrls.slice(0, 24),
+      square_photos: Object.keys(squarePhotos).length > 0 ? squarePhotos : undefined,
+    },
+    agent_metadata: {
+      ...agentOutput.agent_metadata,
+      flags,
+      image_processing_jobs: allJobs,
+    },
+  };
+  assertAgentOutputShape(nextOutput);
+
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        `UPDATE items
+         SET agent_output = ?1,
+             agent_flags = ?2,
+             updated_at = ?3
+         WHERE sku = ?4 AND status = 'needs_approval'`
+      )
+      .bind(JSON.stringify(nextOutput), JSON.stringify(flags), now, row.sku),
+    env.DB
+      .prepare(
+        `INSERT INTO audit_log (sku, at, actor, event, detail)
+         VALUES (?1, ?2, 'content-agent', 'square_images_processed', ?3)`
+      )
+      .bind(
+        row.sku,
+        now,
+        JSON.stringify({
+          model,
+          prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
+          generated_slots: uniqueGeneratedSlots,
+          job_details: jobDetails,
+          failures: failedDetails,
+        })
+      ),
+  ]);
+
+  return {
+    ok: uniqueGeneratedSlots.length > 0 && failedDetails.length === 0,
+    processed: uniqueGeneratedSlots.length > 0,
+    status: uniqueGeneratedSlots.length > 0 ? "square_processed" : "square_failed",
+    sku: row.sku,
+    generated_slots: uniqueGeneratedSlots,
+    failures: failedDetails,
+  };
+}
+
+async function findSquareDerivativeCandidate(env: Env, targetSku?: string): Promise<SquareCandidateRow | null> {
+  const selectFields = "sku, category, processed_photos, agent_output, agent_flags";
+  const pendingPredicate = `
+    status = 'needs_approval'
+    AND processed_photos IS NOT NULL
+    AND agent_output IS NOT NULL
+    AND COALESCE(agent_flags, '') LIKE '%image_processing_square_deferred%'
+    AND COALESCE(agent_flags, '') NOT LIKE '%image_processing_square_v1%'
+    AND COALESCE(agent_flags, '') NOT LIKE '%image_processing_square_failed%'
+  `;
+
+  if (targetSku) {
+    return env.DB
+      .prepare(`SELECT ${selectFields} FROM items WHERE sku = ?1 AND ${pendingPredicate} LIMIT 1`)
+      .bind(targetSku)
+      .first<SquareCandidateRow>();
+  }
+
+  return env.DB
+    .prepare(`SELECT ${selectFields} FROM items WHERE ${pendingPredicate} ORDER BY updated_at ASC LIMIT 1`)
+    .first<SquareCandidateRow>();
+}
+
+async function markSquareDerivativeFailure(
+  env: Env,
+  row: SquareCandidateRow,
+  flags: string[],
+  now: string,
+  jobDetails: JsonValue[]
+): Promise<void> {
+  const existingFlags = parseStringArray(row.agent_flags);
+  const nextFlags = unique([...existingFlags, "image_processing_square_failed", ...flags]);
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        `UPDATE items
+         SET agent_flags = ?1,
+             updated_at = ?2
+         WHERE sku = ?3 AND status = 'needs_approval'`
+      )
+      .bind(JSON.stringify(nextFlags), now, row.sku),
+    env.DB
+      .prepare(
+        `INSERT INTO audit_log (sku, at, actor, event, detail)
+         VALUES (?1, ?2, 'content-agent', 'square_images_failed', ?3)`
+      )
+      .bind(row.sku, now, JSON.stringify({ flags, job_details: jobDetails })),
+  ]);
 }
 
 async function processImageJob(
@@ -1207,11 +1447,76 @@ function buildImageProcessingJobs(rawPhotos: RawPhotos): ImageProcessingJob[] {
       outputName: "ghost-mannequin",
       sourceUrl: flatLayUrl,
       promptKind: "ghost_mannequin",
-      includeLogoReference: false,
+      includeLogoReference: true,
     });
   }
 
   return jobs;
+}
+
+function buildSquareProcessingJobs(
+  agentOutput: AgentOutput,
+  processedPhotos: RawPhotos,
+  existingSquarePhotos: RawPhotos
+): ImageProcessingJob[] {
+  const jobs: ImageProcessingJob[] = [];
+  const seen = new Set<string>();
+  const sourceJobs = (agentOutput.agent_metadata.image_processing_jobs ?? [])
+    .filter(isSuccessfulProcessedImageJob);
+
+  for (const job of sourceJobs) {
+    const slot = cleanText(job.slot, "", 64);
+    const sourceUrl = cleanText(job.output_url, "", 2000);
+    const sourceIndex = Number.isInteger(job.source_index) && Number(job.source_index) >= 0 ? Number(job.source_index) : 0;
+    if (!slot || !sourceUrl.startsWith(IMAGE_PREFIX)) continue;
+    if (firstPhoto(existingSquarePhotos[slot])) continue;
+    const key = `${slot}:${sourceIndex}:${sourceUrl}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    jobs.push({
+      sourceSlot: slot,
+      sourceIndex,
+      outputSlot: slot,
+      outputName: `${slot.replace(/_/g, "-")}-1x1${sourceIndex > 0 ? `-${sourceIndex + 1}` : ""}`,
+      sourceUrl,
+      promptKind: "square_reformat",
+      includeLogoReference: false,
+    });
+  }
+
+  if (jobs.length > 0) return jobs;
+
+  for (const [slot, value] of Object.entries(processedPhotos)) {
+    if (firstPhoto(existingSquarePhotos[slot])) continue;
+    const urls = Array.isArray(value) ? value : [value];
+    urls.forEach((url, index) => {
+      if (!url.startsWith(IMAGE_PREFIX)) return;
+      jobs.push({
+        sourceSlot: slot,
+        sourceIndex: index,
+        outputSlot: slot,
+        outputName: `${slot.replace(/_/g, "-")}-1x1${urls.length > 1 ? `-${index + 1}` : ""}`,
+        sourceUrl: url,
+        promptKind: "square_reformat",
+        includeLogoReference: false,
+      });
+    });
+  }
+
+  return jobs;
+}
+
+function isSuccessfulProcessedImageJob(
+  value: JsonValue
+): value is { slot: string; output_url: string; source_index?: number } {
+  return (
+    isPlainObject(value) &&
+    value.variant === "processed_3x4" &&
+    value.ok === true &&
+    typeof value.slot === "string" &&
+    typeof value.output_url === "string" &&
+    (value.source_index === undefined || typeof value.source_index === "number")
+  );
 }
 
 async function fetchImageReferences(
@@ -1431,6 +1736,10 @@ function imageReferenceUrls(job: ImageProcessingJob, references: ImageReferenceS
   const urls = [`@img1: ${job.sourceUrl}`, `@img2: ${references.backgroundUrl}`];
   if (job.includeLogoReference) urls.push(`@img3: ${references.logoUrl}`);
   return urls;
+}
+
+function squareImageReferenceUrls(job: ImageProcessingJob): string[] {
+  return [`@img1: ${job.sourceUrl}`];
 }
 
 function extractGeneratedImage(response: Record<string, unknown>): { mimeType: string; base64Data: string } {
@@ -2305,6 +2614,7 @@ function assertAgentOutputShape(output: AgentOutput): void {
     !output.media.square_image_urls || output.media.square_image_urls.length <= 24,
     "media.square_image_urls must be at most 24 URLs"
   );
+  assert(!output.media.square_photos || isRawPhotos(output.media.square_photos), "media.square_photos must be an R2 URL map");
   assert(output.agent_metadata.generated_at.includes("T"), "generated_at must be ISO-like");
 }
 
@@ -2331,6 +2641,16 @@ function parseJson<T>(value: string, label: string): T {
 function parseOptionalJson(value: string | null, label: string): unknown {
   if (value === null || value === "") return null;
   return parseJson<unknown>(value, label);
+}
+
+function parseStringArray(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
