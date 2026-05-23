@@ -120,6 +120,9 @@ interface ImageProcessingResult {
   model: string;
   flags: string[];
   generatedSlots: string[];
+  squareGeneratedSlots: string[];
+  squarePhotos: RawPhotos;
+  jobDetails: JsonValue[];
   detail: string;
 }
 
@@ -131,9 +134,11 @@ interface ImageInput {
 interface ImageReferenceSet {
   background: ImageInput;
   logo: ImageInput;
+  backgroundUrl: string;
+  logoUrl: string;
 }
 
-type ImagePromptKind = "on_model_original" | "product" | "ghost_mannequin";
+type ImagePromptKind = "on_model_original" | "product" | "ghost_mannequin" | "square_reformat";
 
 interface ImageProcessingJob {
   sourceSlot: string;
@@ -217,6 +222,8 @@ interface AgentOutput {
   media: {
     primary_image_url: string;
     image_urls: string[];
+    square_primary_image_url?: string;
+    square_image_urls?: string[];
   };
   agent_metadata: {
     agent_version: string;
@@ -347,6 +354,8 @@ CRITICAL MASTER SET PRESERVATION: Replace the original background (wood floor, c
 PRODUCT PRESERVATION & LIGHTING: Relight the item and the scene with high-key, wrapping softbox studio lighting, applying very soft, feathered, and subtle shadows to ground the item naturally. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the item. Do not apply dramatic lighting, harsh shadows, or contrast boosts that could crush the item's color. High-end editorial studio photography, premium quality, true-to-life color representation, texture-enhancing composition. DO NOT ADD ANYTHING.`;
 
 const GHOST_MANNEQUIN_PROMPT = `Replace the background (wood floor, carpet or backdrop) behind the item in @img1 with @img2 (background with logo). Relight the item with high-key, wrapping softbox studio lighting, applying very soft, feathered, and subtle shadows. The item should be displayed in a refined 3D 'ghost mannequin' style, appearing as if worn by an invisible person to maintain its natural shape, elegant silhouette, and fluid drape. Front-facing eye-level perspective. Ensure the product in @img1 is not cropped, cut off, warped, or significantly altered. If the product covers the area where the logo should appear, superimpose only the logo with no background. Product shot, premium quality, true-to-life color representation, texture-enhancing composition. Editorial fashion presentation, luxurious fabric detail, high-resolution texture, visible fabric weave, clean crisp edges. 8k resolution, commercial luxury fashion catalog style. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the item. Do not apply dramatic lighting, harsh shadows, or contrast boosts that could crush the item's color. DO NOT ADD ANYTHING.`;
+
+const SQUARE_REFORMAT_PROMPT = "Do not change the image. Accurately recreate the reference image and keep the subject and lighting exactly the same. We're just creating a 1:1 deliverable from the 3:4 @img1. Keep LOGO in lower right corner. ";
 
 const PHOTO_SLOT_LABELS: Record<string, string> = {
   damage: "Damage",
@@ -653,7 +662,9 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
   const processedPhotos = copyRawPhotos(rawPhotos);
   const imageProcessing = await processImages(env, item, processedPhotos, now);
   const imageUrls = flattenPhotoUrls(processedPhotos);
+  const squareImageUrls = flattenPhotoUrls(imageProcessing.squarePhotos);
   const primaryImage = pickPrimaryImage(processedPhotos, config.hero, imageUrls);
+  const squarePrimaryImage = pickPrimaryImage(imageProcessing.squarePhotos, config.hero, squareImageUrls);
 
   if (!primaryImage) throw new Error("processed_photos produced no media URLs");
 
@@ -727,6 +738,8 @@ async function buildAgentPayload(env: Env, item: ParsedItem, now: string): Promi
     media: {
       primary_image_url: primaryImage.url,
       image_urls: imageUrls.slice(0, 24),
+      square_primary_image_url: squarePrimaryImage?.url,
+      square_image_urls: squareImageUrls.slice(0, 24),
     },
     agent_metadata: {
       agent_version: AGENT_VERSION,
@@ -803,6 +816,8 @@ async function commitProcessed(
       model: generated.imageProcessing.model,
       prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
       generated_slots: generated.imageProcessing.generatedSlots,
+      square_generated_slots: generated.imageProcessing.squareGeneratedSlots,
+      job_details: generated.imageProcessing.jobDetails,
       detail: generated.imageProcessing.detail,
     }),
   };
@@ -950,6 +965,9 @@ async function processImages(
       model,
       flags: ["processed_photos_reuse_raw_uploads"],
       generatedSlots: [],
+      squareGeneratedSlots: [],
+      squarePhotos: {},
+      jobDetails: [],
       detail: "Nano Banana is disabled; uploaded photos were reused as processed photos.",
     };
   }
@@ -962,6 +980,9 @@ async function processImages(
       model,
       flags: ["processed_photos_reuse_raw_uploads", "image_processing_not_configured"],
       generatedSlots: [],
+      squareGeneratedSlots: [],
+      squarePhotos: {},
+      jobDetails: [],
       detail: "Nano Banana is enabled but GEMINI_API_KEY is not configured; uploaded photos were reused as processed photos.",
     };
   }
@@ -974,6 +995,9 @@ async function processImages(
       model,
       flags: ["processed_photos_reuse_raw_uploads", "image_processing_skipped_no_supported_photo_slots"],
       generatedSlots: [],
+      squareGeneratedSlots: [],
+      squarePhotos: {},
+      jobDetails: [],
       detail: "Nano Banana found no supported still-photo upload slots to process.",
     };
   }
@@ -987,6 +1011,9 @@ async function processImages(
       model,
       flags: unique(["processed_photos_reuse_raw_uploads", ...references.flags]),
       generatedSlots: [],
+      squareGeneratedSlots: [],
+      squarePhotos: {},
+      jobDetails: [],
       detail: references.detail,
     };
   }
@@ -998,20 +1025,89 @@ async function processImages(
   const generatedSlots: string[] = [];
   const failedFlags: string[] = [];
   const failedDetails: string[] = [];
+  const jobDetails: JsonValue[] = [];
+  const squarePhotos: RawPhotos = {};
 
   for (const result of results) {
     if (result.ok) {
       setProcessedPhoto(processedPhotos, result.job, result.publicUrl);
       generatedSlots.push(result.job.outputSlot);
+      jobDetails.push(
+        toJsonValue({
+          slot: result.job.outputSlot,
+          source_slot: result.job.sourceSlot,
+          prompt_kind: result.job.promptKind,
+          prompt_label: promptLabel(result.job.promptKind),
+          reference_urls: imageReferenceUrls(result.job, references.references),
+          output_url: result.publicUrl,
+          ok: true,
+        })
+      );
     } else {
       failedFlags.push(result.failure.flag, `image_processing_failed_${normalizeTag(result.job.outputSlot)}`);
       failedDetails.push(`${result.job.outputSlot}: ${result.failure.detail}`);
+      jobDetails.push(
+        toJsonValue({
+          slot: result.job.outputSlot,
+          source_slot: result.job.sourceSlot,
+          prompt_kind: result.job.promptKind,
+          prompt_label: promptLabel(result.job.promptKind),
+          reference_urls: imageReferenceUrls(result.job, references.references),
+          ok: false,
+          failure: result.failure.detail,
+        })
+      );
     }
   }
 
   const uniqueGeneratedSlots = unique(generatedSlots);
   const allGenerated = uniqueGeneratedSlots.length > 0 && failedDetails.length === 0;
   const generatedJobCount = results.filter((result) => result.ok).length;
+  const successfulResults = results.filter((result) => result.ok);
+  const squareResults = await Promise.all(
+    successfulResults.map((result) =>
+      processSquareImageJob(env, apiKey, model, item.sku, result.job, result.sourceForSquare, timeoutMs, now)
+    )
+  );
+  const squareGeneratedSlots: string[] = [];
+  const squareFailedFlags: string[] = [];
+  const squareFailedDetails: string[] = [];
+
+  for (const result of squareResults) {
+    if (result.ok) {
+      setProcessedPhoto(squarePhotos, result.job, result.publicUrl);
+      squareGeneratedSlots.push(result.job.outputSlot);
+      jobDetails.push(
+        toJsonValue({
+          slot: result.job.outputSlot,
+          source_slot: result.job.outputSlot,
+          prompt_kind: "square_reformat",
+          prompt_label: promptLabel("square_reformat"),
+          reference_urls: ["@img1: generated 3:4 processed image"],
+          output_url: result.publicUrl,
+          ok: true,
+        })
+      );
+    } else {
+      squareFailedFlags.push(result.failure.flag, `image_processing_square_failed_${normalizeTag(result.job.outputSlot)}`);
+      squareFailedDetails.push(`${result.job.outputSlot}: ${result.failure.detail}`);
+      jobDetails.push(
+        toJsonValue({
+          slot: result.job.outputSlot,
+          source_slot: result.job.outputSlot,
+          prompt_kind: "square_reformat",
+          prompt_label: promptLabel("square_reformat"),
+          reference_urls: ["@img1: generated 3:4 processed image"],
+          ok: false,
+          failure: result.failure.detail,
+        })
+      );
+    }
+  }
+
+  const uniqueSquareGeneratedSlots = unique(squareGeneratedSlots);
+  const allSquaresGenerated =
+    generatedJobCount > 0 && uniqueSquareGeneratedSlots.length > 0 && squareFailedDetails.length === 0;
   const rawPhotosStillIncluded = generatedJobCount < jobs.length || usesAnyRawUpload(item.rawPhotos, processedPhotos);
   const flags = unique([
     uniqueGeneratedSlots.length > 0 && rawPhotosStillIncluded ? rawReuseFlag : "",
@@ -1019,9 +1115,13 @@ async function processImages(
     uniqueGeneratedSlots.length > 0 ? `image_processing_prompt_${IMAGE_PROCESSING_PROMPT_VERSION}` : "",
     uniqueGeneratedSlots.includes("ghost_mannequin") ? "processed_photos_include_generated_ghost_mannequin" : "",
     allGenerated ? "image_processing_all_supported_slots_generated" : "",
+    uniqueSquareGeneratedSlots.length > 0 ? "image_processing_square_v1" : "",
+    allSquaresGenerated ? "image_processing_square_all_supported_slots_generated" : "",
     uniqueGeneratedSlots.length > 0 && failedDetails.length > 0 ? "image_processing_partial" : "",
+    uniqueSquareGeneratedSlots.length > 0 && squareFailedDetails.length > 0 ? "image_processing_square_partial" : "",
     uniqueGeneratedSlots.length === 0 ? "image_processing_failed" : "",
     ...failedFlags,
+    ...squareFailedFlags,
   ]);
 
   if (uniqueGeneratedSlots.length === 0) {
@@ -1031,20 +1131,26 @@ async function processImages(
       model,
       flags: unique(["processed_photos_reuse_raw_uploads", ...flags]),
       generatedSlots: [],
+      squareGeneratedSlots: [],
+      squarePhotos,
+      jobDetails,
       detail: `Nano Banana did not generate any processed photos. ${failedDetails.join(" ")}`,
     };
   }
 
   return {
-    ok: allGenerated,
+    ok: allGenerated && allSquaresGenerated,
     enabled: true,
     model,
     flags,
     generatedSlots: uniqueGeneratedSlots,
+    squareGeneratedSlots: uniqueSquareGeneratedSlots,
+    squarePhotos,
+    jobDetails,
     detail:
-      failedDetails.length === 0
-        ? `Nano Banana processed ${uniqueGeneratedSlots.length} supported photo slot(s) with the prompt database reference images.`
-        : `Nano Banana processed ${uniqueGeneratedSlots.length} supported photo slot(s); ${failedDetails.length} job(s) reused uploads. ${failedDetails.join(" ")}`,
+      failedDetails.length === 0 && squareFailedDetails.length === 0
+        ? `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s) and ${uniqueSquareGeneratedSlots.length} square derivative slot(s) with the prompt database reference images.`
+        : `Nano Banana processed ${uniqueGeneratedSlots.length} supported 3:4 photo slot(s) and ${uniqueSquareGeneratedSlots.length} square derivative slot(s); ${failedDetails.length + squareFailedDetails.length} job(s) need review. ${[...failedDetails, ...squareFailedDetails].join(" ")}`,
   };
 }
 
@@ -1058,7 +1164,7 @@ async function processImageJob(
   timeoutMs: number,
   now: string
 ): Promise<
-  | { ok: true; job: ImageProcessingJob; publicUrl: string }
+  | { ok: true; job: ImageProcessingJob; publicUrl: string; sourceForSquare: ImageInput }
   | { ok: false; job: ImageProcessingJob; failure: { flag: string; detail: string } }
 > {
   try {
@@ -1068,6 +1174,41 @@ async function processImageJob(
       callGeminiImageEdit(apiKey, model, prompt, source, references, job.includeLogoReference, signal)
     );
     const key = processedImageKey(sku, job.outputName, generated.mimeType, now);
+    await env.PHOTOS.put(key, generated.bytes, {
+      httpMetadata: { contentType: generated.mimeType },
+    });
+    return {
+      ok: true,
+      job,
+      publicUrl: `${IMAGE_PREFIX}${key}`,
+      sourceForSquare: {
+        mimeType: generated.mimeType,
+        base64Data: arrayBufferToBase64(generated.bytes),
+      },
+    };
+  } catch (error) {
+    return { ok: false, job, failure: describeImageProcessingFailure(error) };
+  }
+}
+
+async function processSquareImageJob(
+  env: Env,
+  apiKey: string,
+  model: string,
+  sku: string,
+  job: ImageProcessingJob,
+  source: ImageInput,
+  timeoutMs: number,
+  now: string
+): Promise<
+  | { ok: true; job: ImageProcessingJob; publicUrl: string }
+  | { ok: false; job: ImageProcessingJob; failure: { flag: string; detail: string } }
+> {
+  try {
+    const generated = await withTimeout(timeoutMs, (signal) =>
+      callGeminiImageEdit(apiKey, model, SQUARE_REFORMAT_PROMPT, source, null, false, signal)
+    );
+    const key = processedSquareImageKey(sku, job.outputName, generated.mimeType, now);
     await env.PHOTOS.put(key, generated.bytes, {
       httpMetadata: { contentType: generated.mimeType },
     });
@@ -1140,7 +1281,7 @@ async function fetchImageReferences(
       withTimeout(timeoutMs, (signal) => fetchImageInput(backgroundUrl, signal)),
       withTimeout(timeoutMs, (signal) => fetchImageInput(logoUrl, signal)),
     ]);
-    return { ok: true, references: { background, logo } };
+    return { ok: true, references: { background, logo, backgroundUrl, logoUrl } };
   } catch (error) {
     const failure = describeImageProcessingFailure(error);
     return {
@@ -1208,7 +1349,7 @@ async function callGeminiImageEdit(
   model: string,
   prompt: string,
   source: ImageInput,
-  references: ImageReferenceSet,
+  references: ImageReferenceSet | null,
   includeLogoReference: boolean,
   signal: AbortSignal
 ): Promise<{ mimeType: string; bytes: ArrayBuffer }> {
@@ -1221,16 +1362,21 @@ async function callGeminiImageEdit(
         data: source.base64Data,
       },
     },
-    { text: "Reference @img2: branded Master Studio Set background with logo." },
-    {
-      inline_data: {
-        mime_type: references.background.mimeType,
-        data: references.background.base64Data,
-      },
-    },
   ];
 
-  if (includeLogoReference) {
+  if (references) {
+    parts.push(
+      { text: "Reference @img2: branded Master Studio Set background with logo." },
+      {
+        inline_data: {
+          mime_type: references.background.mimeType,
+          data: references.background.base64Data,
+        },
+      }
+    );
+  }
+
+  if (references && includeLogoReference) {
     parts.push(
       { text: "Reference @img3 / @img_logo_ref: transparent Thread + Time logo reference." },
       {
@@ -1309,7 +1455,21 @@ function describeImageProcessingFailure(error: unknown): { flag: string; detail:
 function buildImageProcessingPrompt(kind: ImagePromptKind): string {
   if (kind === "on_model_original") return ON_MODEL_ORIGINAL_PROMPT;
   if (kind === "ghost_mannequin") return GHOST_MANNEQUIN_PROMPT;
+  if (kind === "square_reformat") return SQUARE_REFORMAT_PROMPT;
   return PRODUCT_PROMPT;
+}
+
+function promptLabel(kind: ImagePromptKind): string {
+  if (kind === "on_model_original") return "ON-MODEL FRONT/BACK (ORIGINAL)";
+  if (kind === "ghost_mannequin") return "GHOST MANNEQUIN";
+  if (kind === "square_reformat") return "1:1 REFORMAT";
+  return "FLAT LAY / DAMAGE / DETAIL / ON-MODEL HERO / HANGER / TAG-LABEL";
+}
+
+function imageReferenceUrls(job: ImageProcessingJob, references: ImageReferenceSet): string[] {
+  const urls = [`@img1: ${job.sourceUrl}`, `@img2: ${references.backgroundUrl}`];
+  if (job.includeLogoReference) urls.push(`@img3: ${references.logoUrl}`);
+  return urls;
 }
 
 function extractGeneratedImage(response: Record<string, unknown>): { mimeType: string; base64Data: string } {
@@ -1345,6 +1505,13 @@ function processedImageKey(sku: string, outputName: string, mimeType: string, no
   const safeOutput = outputName.replace(/[^a-zA-Z0-9_-]+/g, "-");
   const stamp = now.replace(/[^0-9]/g, "").slice(0, 14);
   return `${safeSku}/processed/${safeOutput}-${stamp}.${imageExtension(mimeType)}`;
+}
+
+function processedSquareImageKey(sku: string, outputName: string, mimeType: string, now: string): string {
+  const safeSku = sku.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  const safeOutput = outputName.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  const stamp = now.replace(/[^0-9]/g, "").slice(0, 14);
+  return `${safeSku}/processed-square/${safeOutput}-${stamp}.${imageExtension(mimeType)}`;
 }
 
 function sanitizeImageMimeType(value: unknown, url: string): string {
@@ -2169,6 +2336,14 @@ function assertAgentOutputShape(output: AgentOutput): void {
   assert(output.platform_specific.depop.hashtags.length === 5, "Depop requires exactly 5 hashtags");
   assert(output.media.primary_image_url.startsWith(IMAGE_PREFIX), "primary_image_url must be an R2 public URL");
   assert(output.media.image_urls.length > 0 && output.media.image_urls.length <= 24, "media.image_urls must be 1-24 URLs");
+  assert(
+    !output.media.square_primary_image_url || output.media.square_primary_image_url.startsWith(IMAGE_PREFIX),
+    "square_primary_image_url must be an R2 public URL"
+  );
+  assert(
+    !output.media.square_image_urls || output.media.square_image_urls.length <= 24,
+    "media.square_image_urls must be at most 24 URLs"
+  );
   assert(output.agent_metadata.generated_at.includes("T"), "generated_at must be ISO-like");
 }
 

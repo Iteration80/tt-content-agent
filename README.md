@@ -2,7 +2,7 @@
 
 Cloudflare Worker that claims submitted intake rows and moves them to review.
 
-This deployable version runs deterministic photo QA, an optional Nano Banana image-processing pass, and, when configured, an AI listing pass. By default it reuses the real uploaded R2 photo URLs as `processed_photos`; when image processing is enabled and the branded reference images are configured, it processes every supported uploaded still-photo slot, generates `ghost_mannequin` from `flat_lay`, and stores the outputs back in R2. It checks uploaded photo slot coverage, asks the listing model for schema-constrained title/description/tag/color suggestions, and sets `status='needs_approval'`. If an AI key, reference asset, or provider call is missing/failing, it still produces a deterministic fallback listing so the intake/review flow stays usable.
+This deployable version runs deterministic photo QA, an optional Nano Banana image-processing pass, and, when configured, an AI listing pass. By default it reuses the real uploaded R2 photo URLs as `processed_photos`; when image processing is enabled and the branded reference images are configured, it processes every supported uploaded still-photo slot, generates `ghost_mannequin` from `flat_lay`, stores the 3:4 outputs back in R2, then creates 1:1 derivatives in R2 for downstream marketplace use. It checks uploaded photo slot coverage, asks the listing model for schema-constrained title/description/tag/color suggestions, and sets `status='needs_approval'`. If an AI key, reference asset, or provider call is missing/failing, it still produces a deterministic fallback listing so the intake/review flow stays usable.
 
 ## Commands
 
