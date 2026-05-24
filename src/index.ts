@@ -147,6 +147,7 @@ interface ImageReferenceSet {
 }
 
 type ImagePromptKind = "on_model_original" | "product" | "ghost_mannequin" | "square_reformat";
+type ImageAspectRatio = "3:4" | "1:1";
 
 interface ImageProcessingJob {
   sourceSlot: string;
@@ -1071,6 +1072,7 @@ async function processImages(
           prompt_label: promptLabel(result.job.promptKind),
           prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
           prompt_text: buildImageProcessingPrompt(result.job.promptKind),
+          requested_aspect_ratio: "3:4",
           reference_urls: imageReferenceUrls(result.job, references.references),
           output_url: result.publicUrl,
           ok: true,
@@ -1089,6 +1091,7 @@ async function processImages(
           prompt_label: promptLabel(result.job.promptKind),
           prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
           prompt_text: buildImageProcessingPrompt(result.job.promptKind),
+          requested_aspect_ratio: "3:4",
           reference_urls: imageReferenceUrls(result.job, references.references),
           ok: false,
           failure: result.failure.detail,
@@ -1211,6 +1214,7 @@ async function processSquareDerivativesForOne(
           prompt_label: promptLabel(result.job.promptKind),
           prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
           prompt_text: buildImageProcessingPrompt(result.job.promptKind),
+          requested_aspect_ratio: "1:1",
           reference_urls: squareImageReferenceUrls(result.job),
           output_url: result.publicUrl,
           ok: true,
@@ -1229,6 +1233,7 @@ async function processSquareDerivativesForOne(
           prompt_label: promptLabel(result.job.promptKind),
           prompt_version: IMAGE_PROCESSING_PROMPT_VERSION,
           prompt_text: buildImageProcessingPrompt(result.job.promptKind),
+          requested_aspect_ratio: "1:1",
           reference_urls: squareImageReferenceUrls(result.job),
           ok: false,
           failure: result.failure.detail,
@@ -1372,7 +1377,7 @@ async function processImageJob(
     const source = await withTimeout(timeoutMs, (signal) => fetchImageInput(job.sourceUrl, signal));
     const prompt = buildImageProcessingPrompt(job.promptKind);
     const generated = await withTimeout(timeoutMs, (signal) =>
-      callGeminiImageEdit(apiKey, model, prompt, source, references, job.includeLogoReference, signal)
+      callGeminiImageEdit(apiKey, model, prompt, source, references, job.includeLogoReference, "3:4", signal)
     );
     const key = processedImageKey(sku, job.outputName, generated.mimeType, now);
     await env.PHOTOS.put(key, generated.bytes, {
@@ -1407,7 +1412,7 @@ async function processSquareImageJob(
 > {
   try {
     const generated = await withTimeout(timeoutMs, (signal) =>
-      callGeminiImageEdit(apiKey, model, SQUARE_REFORMAT_PROMPT, source, null, false, signal)
+      callGeminiImageEdit(apiKey, model, SQUARE_REFORMAT_PROMPT, source, null, false, "1:1", signal)
     );
     const key = processedSquareImageKey(sku, job.outputName, generated.mimeType, now);
     await env.PHOTOS.put(key, generated.bytes, {
@@ -1617,6 +1622,7 @@ async function callGeminiImageEdit(
   source: ImageInput,
   references: ImageReferenceSet | null,
   includeLogoReference: boolean,
+  aspectRatio: ImageAspectRatio,
   signal: AbortSignal
 ): Promise<{ mimeType: string; bytes: ArrayBuffer }> {
   const parts: unknown[] = [
@@ -1669,6 +1675,11 @@ async function callGeminiImageEdit(
       ],
       generationConfig: {
         responseModalities: ["Image"],
+        responseFormat: {
+          image: {
+            aspectRatio,
+          },
+        },
       },
     }),
   });
