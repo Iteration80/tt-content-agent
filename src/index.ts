@@ -148,6 +148,7 @@ interface ImageReferenceSet {
 
 type ImagePromptKind = "on_model_original" | "product" | "ghost_mannequin" | "square_reformat";
 type ImageAspectRatio = "3:4" | "1:1";
+type GeminiAspectRatio = "ASPECT_RATIO_THREE_BY_FOUR" | "ASPECT_RATIO_ONE_BY_ONE";
 
 interface ImageProcessingJob {
   sourceSlot: string;
@@ -1677,7 +1678,7 @@ async function callGeminiImageEdit(
         responseModalities: ["Image"],
         responseFormat: {
           image: {
-            aspectRatio,
+            aspectRatio: geminiAspectRatio(aspectRatio),
           },
         },
       },
@@ -1808,6 +1809,10 @@ function sanitizeImageMimeType(value: unknown, url: string): string {
   if (pathname.endsWith(".png")) return "image/png";
   if (pathname.endsWith(".webp")) return "image/webp";
   return "image/jpeg";
+}
+
+function geminiAspectRatio(aspectRatio: ImageAspectRatio): GeminiAspectRatio {
+  return aspectRatio === "1:1" ? "ASPECT_RATIO_ONE_BY_ONE" : "ASPECT_RATIO_THREE_BY_FOUR";
 }
 
 function imageExtension(mimeType: string): "jpg" | "png" | "webp" {
