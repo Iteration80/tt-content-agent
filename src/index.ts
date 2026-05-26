@@ -13,6 +13,7 @@ interface Env {
   TT_IMAGE_PROCESSING_ENABLED?: string;
   TT_IMAGE_PROCESSING_MODEL?: string;
   TT_IMAGE_PROCESSING_TIMEOUT_MS?: string;
+  TT_IMAGE_PROCESSING_CONCURRENCY?: string;
   TT_IMAGE_REFERENCE_BACKGROUND_URL?: string;
   TT_IMAGE_REFERENCE_LOGO_URL?: string;
 }
@@ -136,17 +137,27 @@ interface ImageProcessingResult {
 
 interface ImageInput {
   mimeType: string;
-  base64Data: string;
+  bytes: ArrayBuffer;
+}
+
+interface GeminiFileReference {
+  mimeType: string;
+  fileUri: string;
 }
 
 interface ImageReferenceSet {
-  background: ImageInput;
-  logo: ImageInput;
+  background: GeminiFileReference;
+  logo: GeminiFileReference;
   backgroundUrl: string;
   logoUrl: string;
 }
 
-type ImagePromptKind = "on_model_original" | "product" | "ghost_mannequin" | "square_reformat";
+type ImagePromptKind =
+  | "on_model_background_replace"
+  | "product"
+  | "tag_label_background_replace"
+  | "ghost_mannequin"
+  | "square_reformat";
 type ImageAspectRatio = "3:4" | "1:1";
 type GeminiAspectRatio = "ASPECT_RATIO_THREE_BY_FOUR" | "ASPECT_RATIO_ONE_BY_ONE";
 
@@ -313,8 +324,10 @@ const DEFAULT_LISTING_AI_TIMEOUT_MS = 20_000;
 const LISTING_AI_TOOL_NAME = "emit_listing_draft";
 const DEFAULT_IMAGE_PROCESSING_MODEL = "gemini-2.5-flash-image";
 const GEMINI_GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
-const IMAGE_PROCESSING_PROMPT_VERSION = "nano-banana-prompt-db-v1";
+const GEMINI_FILE_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files";
+const IMAGE_PROCESSING_PROMPT_VERSION = "nano-banana-prompt-db-v3";
 const DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS = 45_000;
+const DEFAULT_IMAGE_PROCESSING_CONCURRENCY = 2;
 const STALE_PROCESSING_RETRY_MS = 10 * 60 * 1000;
 
 const RECOMMENDED_PHOTO_SLOTS = [
@@ -344,19 +357,21 @@ const IMAGE_PROCESSING_UPLOAD_SLOTS = [
   "tag_label",
 ];
 
-const ON_MODEL_ORIGINAL_PROMPT_SLOTS = new Set(["on_model_back", "on_model_front"]);
+const ON_MODEL_BACKGROUND_REPLACE_PROMPT_SLOTS = new Set(["on_model_back", "on_model_front"]);
 
-const ON_MODEL_ORIGINAL_PROMPT = `Composite the model from @img1 into the Master Studio Set provided in @img2 (background and logo).
+const ON_MODEL_BACKGROUND_REPLACE_PROMPT = `Use @img1 as the source photo of the model wearing the garment.
 
-CRITICAL FRAMING & CROP: Strictly replicate the exact framing, composition, pose, and cropping shown in @img1. Do not add feet, extend legs, or generate any anatomical elements not present in @img1. The final image boundaries must perfectly match @img1.
+TASK: Replace the background only. Remove the gray backdrop, visible room edges, wood floor, lights, furniture, and any non-studio surroundings from @img1. Composite the unchanged model and garment onto the Master Studio Set from @img2.
 
-CRITICAL MASTER SET PRESERVATION: Replace the original background with the exact light beige floor, backdrop wall, and horizontal fold (seam) from @img2, fitting it to the strict framing of @img1. Ensure the logo and text from @img2 (referenced perfectly in @img_logo_ref) is clearly visible in the lower right corner. If the strict framing or the model's body covers this area, you must superimpose the logo/text (with no background) directly over the model or garment in that corner.
+CRITICAL MODEL AND GARMENT PRESERVATION: Preserve the model's pose, body proportions, face, hair, expression, skin, jewelry, clothing, garment shape, garment colors, print, texture, and visible wrinkles from @img1. Do not redesign the garment. Do not change the model. Do not add or remove body parts. Do not create a different person.
 
-IDENTITY, FACE-RELIGHTING, & GARMENT PRESERVATION: CRITICAL: Strictly maintain the identity, facial structure, pose, expression, hair texture, and hairstyle of the specific model from @img1.
+CRITICAL STUDIO SET: The final background must be the light beige Thread + Time studio set from @img2 as a seamless editorial studio sweep. Remove all original room details. Do not include the gray backdrop, baseboards, wall trim, furniture, lights, floor clutter, or residential room features from @img1.
 
-To ensure seamless integration without character drift, relight the face and skin with a clean, neutral daylight color cast, shifting the warm tones of @img1 to neutral daylight. Utilize the wrapping softbox lighting to create very soft, flattering, and subtle definition across the facial structure, avoiding any harsh shadows.
+LOGO: Keep the Thread + Time logo treatment visible in the lower right corner. Use @img3 / @img_logo_ref as the exact logo reference if the logo from @img2 is hidden, cropped, missing, distorted, or too faint. Do not duplicate the logo.
 
-GARMENT PRESERVATION & LIGHTING: Relight the model's clothing and the scene with high-key, wrapping softbox studio lighting. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the garment. Do not apply dramatic lighting or contrast boosts that could crush the garment's color. High-end editorial studio photography, premium quality, true-to-life color representation.`;
+FRAMING: Keep the same general crop and scale as @img1 while fitting the result into a clean 3:4 portrait output. The model should remain naturally grounded with a soft studio contact shadow, not a room floor or baseboard.
+
+OUTPUT: Clean editorial resale product photo, true-to-life color, no gray backdrop, no extra objects, no text changes, no garment edits.`;
 
 const PRODUCT_PROMPT = `Composite the product from @img1 into the Master Studio Set provided in @img2 (background and logo).
 
@@ -365,6 +380,20 @@ CRITICAL FRAMING & CROP: Strictly replicate the exact framing, composition, and 
 CRITICAL MASTER SET PRESERVATION: Replace the original background (wood floor, carpet, or backdrop) behind the item with the exact light beige floor, backdrop wall, and horizontal fold (seam) from @img2, fitting it to the strict framing of @img1. Ensure the logo and text from @img2 (referenced perfectly in @img_logo_ref) is clearly visible in the lower right corner. If the strict framing or the product covers this area, you must superimpose the logo/text (with no background; full transparency) directly over the product in that corner. Do NOT duplicate the LOGO. 
 
 PRODUCT PRESERVATION & LIGHTING: Relight the item and the scene with high-key, wrapping softbox studio lighting, applying very soft, feathered, and subtle shadows to ground the item naturally. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the item. Do not apply dramatic lighting, harsh shadows, or contrast boosts that could crush the item's color. High-end editorial studio photography, premium quality, true-to-life color representation, texture-enhancing composition. DO NOT ADD ANYTHING.`;
+
+const TAG_LABEL_BACKGROUND_REPLACE_PROMPT = `Use @img1 as the source close-up photo of the garment tag or label.
+
+TASK: Replace the background only. Remove the original background behind the garment/tag/hand in @img1 and composite the unchanged foreground onto the Master Studio Set from @img2.
+
+CRITICAL LABEL PRESERVATION: Preserve the garment, label, tag, stitching, fabric texture, fingers/hand if present, and all readable label text exactly as shown in @img1. Do not redraw, invent, blur, crop, warp, enlarge, shrink, or simplify the label. Do not remove the hand if the hand is part of @img1.
+
+CRITICAL STUDIO SET: The final background must be the light beige Thread + Time studio set from @img2. The source background from @img1 must not remain visible behind the garment/tag.
+
+LOGO: Keep the Thread + Time logo treatment visible in the lower right corner. Use @img3 / @img_logo_ref as the exact logo reference if the logo from @img2 is hidden, cropped, missing, distorted, or too faint. Do not duplicate the logo.
+
+FRAMING: Keep the same close-up composition and crop relationship as @img1 while fitting the result into a clean 3:4 portrait output. The label must remain the visual priority and must remain readable.
+
+OUTPUT: Clean resale documentation photo, true-to-life color, readable tag, no extra objects, no invented label content, no garment redesign.`;
 
 const GHOST_MANNEQUIN_PROMPT = `Replace the background (wood floor, carpet or backdrop) behind the item in @img1 with @img2 (background with logo). Relight the item with high-key, wrapping softbox studio lighting, applying very soft, feathered, and subtle shadows. The item should be displayed in a refined 3D 'ghost mannequin' style, appearing as if worn by an invisible person to maintain its natural shape, elegant silhouette, and fluid drape. Front-facing eye-level perspective. Ensure the product in @img1 is not cropped, cut off, warped, or significantly altered. If the product covers the area where the logo should appear, superimpose only the logo with no background. Product shot, premium quality, true-to-life color representation, texture-enhancing composition. Editorial fashion presentation, luxurious fabric detail, high-resolution texture, visible fabric weave, clean crisp edges. 8k resolution, commercial luxury fashion catalog style. CRITICAL: Strictly preserve the original hue, saturation, brightness, contrast, and texture of the item. Do not apply dramatic lighting, harsh shadows, or contrast boosts that could crush the item's color. DO NOT ADD ANYTHING.`;
 
@@ -1034,7 +1063,7 @@ async function processImages(
   }
 
   const timeoutMs = positiveInt(env.TT_IMAGE_PROCESSING_TIMEOUT_MS, DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS);
-  const references = await fetchImageReferences(env, timeoutMs);
+  const references = await fetchImageReferences(env, apiKey, timeoutMs);
   if (!references.ok) {
     return {
       ok: false,
@@ -1049,8 +1078,15 @@ async function processImages(
     };
   }
 
-  const results = await Promise.all(
-    jobs.map((job) => processImageJob(env, apiKey, model, item.sku, job, references.references, timeoutMs, now))
+  const concurrency = boundedPositiveInt(
+    env.TT_IMAGE_PROCESSING_CONCURRENCY,
+    DEFAULT_IMAGE_PROCESSING_CONCURRENCY,
+    4
+  );
+  const results = await mapWithConcurrency(
+    jobs,
+    concurrency,
+    (job) => processImageJob(env, apiKey, model, item.sku, job, references.references, timeoutMs, now)
   );
 
   const generatedSlots: string[] = [];
@@ -1184,15 +1220,22 @@ async function processSquareDerivativesForOne(
   }
 
   const timeoutMs = positiveInt(env.TT_IMAGE_PROCESSING_TIMEOUT_MS, DEFAULT_IMAGE_PROCESSING_TIMEOUT_MS);
-  const results = await Promise.all(
-    jobs.map(async (job) => {
+  const concurrency = boundedPositiveInt(
+    env.TT_IMAGE_PROCESSING_CONCURRENCY,
+    DEFAULT_IMAGE_PROCESSING_CONCURRENCY,
+    4
+  );
+  const results = await mapWithConcurrency(
+    jobs,
+    concurrency,
+    async (job) => {
       try {
         const source = await withTimeout(timeoutMs, (signal) => fetchImageInput(job.sourceUrl, signal));
         return await processSquareImageJob(env, apiKey, model, row.sku, job, source, timeoutMs, now);
       } catch (error) {
         return { ok: false as const, job, failure: describeImageProcessingFailure(error) };
       }
-    })
+    }
   );
 
   const generatedSlots: string[] = [];
@@ -1390,7 +1433,7 @@ async function processImageJob(
       publicUrl: `${IMAGE_PREFIX}${key}`,
       sourceForSquare: {
         mimeType: generated.mimeType,
-        base64Data: arrayBufferToBase64(generated.bytes),
+        bytes: generated.bytes,
       },
     };
   } catch (error) {
@@ -1438,7 +1481,7 @@ function buildImageProcessingJobs(rawPhotos: RawPhotos): ImageProcessingJob[] {
         outputSlot: slot,
         outputName: `${slot.replace(/_/g, "-")}${urls.length > 1 ? `-${index + 1}` : ""}`,
         sourceUrl: url,
-        promptKind: ON_MODEL_ORIGINAL_PROMPT_SLOTS.has(slot) ? "on_model_original" : "product",
+        promptKind: imagePromptKindForSlot(slot),
         includeLogoReference: true,
       });
     });
@@ -1458,6 +1501,12 @@ function buildImageProcessingJobs(rawPhotos: RawPhotos): ImageProcessingJob[] {
   }
 
   return jobs;
+}
+
+function imagePromptKindForSlot(slot: string): ImagePromptKind {
+  if (ON_MODEL_BACKGROUND_REPLACE_PROMPT_SLOTS.has(slot)) return "on_model_background_replace";
+  if (slot === "tag_label") return "tag_label_background_replace";
+  return "product";
 }
 
 function buildSquareProcessingJobs(
@@ -1527,6 +1576,7 @@ function isSuccessfulProcessedImageJob(
 
 async function fetchImageReferences(
   env: Env,
+  apiKey: string,
   timeoutMs: number
 ): Promise<
   | { ok: true; references: ImageReferenceSet }
@@ -1549,9 +1599,15 @@ async function fetchImageReferences(
   }
 
   try {
-    const [background, logo] = await Promise.all([
+    const [backgroundInput, logoInput] = await Promise.all([
       withTimeout(timeoutMs, (signal) => fetchImageInput(backgroundUrl, signal)),
       withTimeout(timeoutMs, (signal) => fetchImageInput(logoUrl, signal)),
+    ]);
+    const [background, logo] = await Promise.all([
+      withTimeout(timeoutMs, (signal) =>
+        uploadGeminiFile(apiKey, backgroundInput, "thread-time-reference-background", signal)
+      ),
+      withTimeout(timeoutMs, (signal) => uploadGeminiFile(apiKey, logoInput, "thread-time-reference-logo", signal)),
     ]);
     return { ok: true, references: { background, logo, backgroundUrl, logoUrl } };
   } catch (error) {
@@ -1596,9 +1652,34 @@ async function withTimeout<T>(timeoutMs: number, task: (signal: AbortSignal) => 
   }
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  task: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await task(items[index], index);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
 function optionalUrl(value: unknown): string | null {
   const url = cleanText(value, "", 2000);
   return url ? url : null;
+}
+
+function sanitizeGeminiDisplayName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80) || "thread-time-image";
 }
 
 async function fetchImageInput(
@@ -1612,8 +1693,65 @@ async function fetchImageInput(
   const bytes = await res.arrayBuffer();
   return {
     mimeType: contentType,
-    base64Data: arrayBufferToBase64(bytes),
+    bytes,
   };
+}
+
+async function uploadGeminiFile(
+  apiKey: string,
+  image: ImageInput,
+  displayName: string,
+  signal: AbortSignal
+): Promise<GeminiFileReference> {
+  const startRes = await fetch(GEMINI_FILE_UPLOAD_URL, {
+    method: "POST",
+    signal,
+    headers: {
+      "x-goog-api-key": apiKey,
+      "content-type": "application/json",
+      "x-goog-upload-protocol": "resumable",
+      "x-goog-upload-command": "start",
+      "x-goog-upload-header-content-length": String(image.bytes.byteLength),
+      "x-goog-upload-header-content-type": image.mimeType,
+    },
+    body: JSON.stringify({
+      file: {
+        display_name: sanitizeGeminiDisplayName(displayName),
+      },
+    }),
+  });
+
+  if (!startRes.ok) {
+    const text = await startRes.text();
+    throw new Error(`Gemini file upload start returned ${startRes.status}: ${geminiErrorMessage(text)}`);
+  }
+
+  const uploadUrl = startRes.headers.get("x-goog-upload-url");
+  if (!uploadUrl) throw new Error("Gemini file upload did not return an upload URL");
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: "POST",
+    signal,
+    headers: {
+      "content-type": image.mimeType,
+      "x-goog-upload-offset": "0",
+      "x-goog-upload-command": "upload, finalize",
+    },
+    body: image.bytes,
+  });
+  const text = await uploadRes.text();
+
+  if (!uploadRes.ok) {
+    throw new Error(`Gemini file upload returned ${uploadRes.status}: ${geminiErrorMessage(text)}`);
+  }
+
+  const parsed = parseJson<Record<string, unknown>>(text, "Gemini file upload response");
+  const file = isPlainObject(parsed.file) ? parsed.file : null;
+  const fileUri = typeof file?.uri === "string" ? file.uri : "";
+  const mimeType = typeof file?.mimeType === "string" ? file.mimeType : image.mimeType;
+  if (!fileUri) throw new Error("Gemini file upload response did not include a file URI");
+
+  return { mimeType, fileUri };
 }
 
 async function callGeminiImageEdit(
@@ -1626,13 +1764,14 @@ async function callGeminiImageEdit(
   aspectRatio: ImageAspectRatio,
   signal: AbortSignal
 ): Promise<{ mimeType: string; bytes: ArrayBuffer }> {
+  const sourceFile = await uploadGeminiFile(apiKey, source, "thread-time-source-upload", signal);
   const parts: unknown[] = [
     { text: prompt },
     { text: "Reference @img1: source upload." },
     {
-      inline_data: {
+      file_data: {
         mime_type: source.mimeType,
-        data: source.base64Data,
+        file_uri: sourceFile.fileUri,
       },
     },
   ];
@@ -1641,9 +1780,9 @@ async function callGeminiImageEdit(
     parts.push(
       { text: "Reference @img2: branded Master Studio Set background with logo." },
       {
-        inline_data: {
+        file_data: {
           mime_type: references.background.mimeType,
-          data: references.background.base64Data,
+          file_uri: references.background.fileUri,
         },
       }
     );
@@ -1653,9 +1792,9 @@ async function callGeminiImageEdit(
     parts.push(
       { text: "Reference @img3 / @img_logo_ref: transparent Thread + Time logo reference." },
       {
-        inline_data: {
+        file_data: {
           mime_type: references.logo.mimeType,
-          data: references.logo.base64Data,
+          file_uri: references.logo.fileUri,
         },
       }
     );
@@ -1731,14 +1870,16 @@ function describeImageProcessingFailure(error: unknown): { flag: string; detail:
 }
 
 function buildImageProcessingPrompt(kind: ImagePromptKind): string {
-  if (kind === "on_model_original") return ON_MODEL_ORIGINAL_PROMPT;
+  if (kind === "on_model_background_replace") return ON_MODEL_BACKGROUND_REPLACE_PROMPT;
+  if (kind === "tag_label_background_replace") return TAG_LABEL_BACKGROUND_REPLACE_PROMPT;
   if (kind === "ghost_mannequin") return GHOST_MANNEQUIN_PROMPT;
   if (kind === "square_reformat") return SQUARE_REFORMAT_PROMPT;
   return PRODUCT_PROMPT;
 }
 
 function promptLabel(kind: ImagePromptKind): string {
-  if (kind === "on_model_original") return "ON-MODEL FRONT/BACK (ORIGINAL)";
+  if (kind === "on_model_background_replace") return "ON-MODEL FRONT/BACK BACKGROUND REPLACE";
+  if (kind === "tag_label_background_replace") return "TAG-LABEL BACKGROUND REPLACE";
   if (kind === "ghost_mannequin") return "GHOST MANNEQUIN";
   if (kind === "square_reformat") return "1:1 REFORMAT";
   return "FLAT LAY / DAMAGE / DETAIL / ON-MODEL HERO / HANGER / TAG-LABEL";
@@ -1819,16 +1960,6 @@ function imageExtension(mimeType: string): "jpg" | "png" | "webp" {
   if (mimeType === "image/png") return "png";
   if (mimeType === "image/webp") return "webp";
   return "jpg";
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
 }
 
 function base64ToArrayBuffer(data: string): ArrayBuffer {
@@ -2553,6 +2684,10 @@ function nonnegativeInt(value: unknown): number {
 function positiveInt(value: unknown, fallback: number): number {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function boundedPositiveInt(value: unknown, fallback: number, max: number): number {
+  return Math.min(positiveInt(value, fallback), max);
 }
 
 function imageProcessingEnabled(env: Env): boolean {
